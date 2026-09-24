@@ -30,7 +30,12 @@ permissions:
 jobs:
   test:
     name: Checks
-    runs-on: ubuntu-latest
+    # AC-4 (task #1376): make check on both validation targets (sdd-spec NFR-003).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout
@@ -41,7 +46,21 @@ jobs:
           # that comparison.
           fetch-depth: 0
 
+      # This repository's own build and test steps (task #1376).
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.7.3"
+          python-version: "3.12"
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: make check
+        run: make check
+
       # ---------------------------------------------------------------------
+      # (Hub provisioning note, kept for context.)
       # ADD THIS REPOSITORY'S OWN BUILD AND TEST STEPS HERE.
       #
       # The hub deliberately does not guess them. Inventing a build command
@@ -64,8 +83,10 @@ jobs:
       #
       # Referenced by version rather than copied: a copy of the reporter in
       # this repository would drift from the original silently.
+      # Reported once per commit, from the ubuntu leg only: both legs run the
+      # same AC tests, and two reports for one commit would race each other.
       - name: Report AC tests and validation to Hub
-        if: ${{ always() }}
+        if: ${{ always() && matrix.os == 'ubuntu-latest' }}
         continue-on-error: true
         uses: agentdrover/haiplane/.github/actions/hub-ci-report@main
         with:
