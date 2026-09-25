@@ -23,6 +23,8 @@ on:
   # COMMIT, so a push of the task branch is enough.
   push:
     branches: ["main", "task-*/**"]
+  # Manual run: the only way besides a push to main to start the macOS leg.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -30,11 +32,14 @@ permissions:
 jobs:
   test:
     name: Checks
-    # AC-4 (task #1376): make check on both validation targets (sdd-spec NFR-003).
+    # make check on both validation targets (sdd-spec NFR-003), but the macOS
+    # leg only on a push to main or a manual run (owner decision 24.09, #1377):
+    # a macOS minute in a private repository costs ten Linux minutes. Every
+    # push and pull request still gets the ubuntu leg, which reports to the hub.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON(((github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -54,10 +59,36 @@ jobs:
           python-version: "3.12"
 
       - name: Install locked dependencies
+        id: install
         run: uv sync --locked
 
-      - name: make check
-        run: make check
+      # make check split into its four targets, one step each, so the hub
+      # report can name every check and its outcome (#1377 AC-6). The later
+      # steps run even when an earlier one fails (the result is still red):
+      # a lint error must not hide what the tests say.
+      - name: Lint (ruff check)
+        id: lint
+        run: make lint
+
+      - name: Format (ruff format --check)
+        id: format
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: make format-check
+
+      - name: Types (mypy --strict)
+        id: types
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: make typecheck
+
+      - name: Tests (pytest)
+        id: tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: make test
+
+      - name: Security tests
+        id: security
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: uv run pytest -q tests/security/
 
       # ---------------------------------------------------------------------
       # (Hub provisioning note, kept for context.)
@@ -94,3 +125,16 @@ jobs:
           hub-token: ${{ secrets.HAIPLANE_HUB_CI_TOKEN }}
           head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
           ac-runner: "uv run pytest"
+          # Step outcomes by name, so the reviewer does not re-judge what a
+          # linter already proved (hub-ci-report input `checks`).
+          checks: >-
+            lint=${{ steps.lint.outcome }},
+            format=${{ steps.format.outcome }},
+            types=${{ steps.types.outcome }},
+            tests=${{ steps.tests.outcome }}
+          # The task's validation commands this job already ran, spelled
+          # exactly as the task names them. `make check` passed only if all
+          # four of its targets did.
+          ran-commands: |
+            ${{ (steps.lint.outcome == 'success' && steps.format.outcome == 'success' && steps.types.outcome == 'success' && steps.tests.outcome == 'success') && 'success' || 'failure' }} make check
+            ${{ steps.security.outcome }} uv run pytest -q tests/security/
