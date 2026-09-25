@@ -1,21 +1,31 @@
 """FR-002 (sdd-spec §7.3, §10 SEC-001/SEC-003): resolve IdentityFile references.
 
 For each ``IdentityFile`` directive found in a parsed ssh_config document,
-constructs a :class:`LocalReference` (kind=``config_identity``) classified into
-one of five resolution states (plus ``unresolved`` for unexpandable tokens):
+:func:`resolve_identity_references` returns an :class:`IdentityReferences`
+result with two parts:
 
-- ``resolved``: a matching ``.pub`` file exists and was safely read through
-  :func:`ssh_id_doctor.fs.read_public_text`.
-- ``private_only``: only the private-key path exists (or the ``.pub`` file
+``references`` — one :class:`LocalReference` (kind=``config_identity``) per
+concrete path, classified into exactly one ``domain.Resolution`` (§7.3):
+
+- ``resolved``: ``<ref>.pub`` exists inside the scan root and was safely read
+  through :func:`ssh_id_doctor.fs.read_public_text`. The ``.pub`` decides on
+  its own: where the private ``<ref>`` points (even a symlink leaving HOME) is
+  irrelevant, and the private file is never opened.
+- ``private_only``: no ``.pub``, only the private path exists (or the ``.pub``
   contained private-key material); the private file is never opened (SEC-001),
   checked only via ``os.stat``.
 - ``missing``: neither ``.pub`` nor the identity file exists.
 - ``unreadable``: the ``.pub`` file could not be read (permission denied, FIFO,
   socket, directory, oversized), or the identity path is a directory.
-- ``outside_root``: the identity path or its ``.pub`` escapes the user's HOME
-  scan root; it is not opened or stat-ed.
-- ``unresolved``: the path contains unexpanded tokens (``%h``, ``%r``, ``%d``,
-  ``%u``, ``${VAR}``); it is not resolved or stat-ed.
+- ``outside_root``: the ``.pub`` itself escapes the scan root, or there is no
+  ``.pub`` and the private path escapes it; nothing outside is opened or stat-ed.
+
+``unresolved`` — an :class:`~ssh_id_doctor.ssh_config.UnresolvedConfigItem`
+(reason ``unresolved_token``, detail = the raw value, with its source file and
+line) for every ``IdentityFile`` whose path carries an unexpanded token
+(``%h``, ``%r``, ``%d``, ``%u``, ``${VAR}``). Such a value is not a
+LocalReference at all (§12: unresolved inputs are reported as unresolved, not
+approximated); it is not resolved or stat-ed.
 
 Scan root rule (FR-002 risk mitigation):
 The scan root for ``IdentityFile`` references is the user's HOME directory, NOT
@@ -31,9 +41,7 @@ import re
 import stat
 from collections.abc import Sequence
 from dataclasses import dataclass
-from enum import StrEnum
 from pathlib import Path
-from typing import cast
 
 from ssh_id_doctor import fs, ssh_config
 from ssh_id_doctor.domain import (
@@ -52,17 +60,7 @@ from ssh_id_doctor.ssh_config import (
 )
 
 _TOKEN_RE = re.compile(r"%[hrdu]|\$\{[^}]*\}")
-
-
-class IdentityResolution(StrEnum):
-    """Resolution states for identity references, extending domain.Resolution with unresolved."""
-
-    RESOLVED = "resolved"
-    MISSING = "missing"
-    UNREADABLE = "unreadable"
-    OUTSIDE_ROOT = "outside_root"
-    PRIVATE_ONLY = "private_only"
-    UNRESOLVED = "unresolved"
+_UNRESOLVED_REASON = "unresolved_token"
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +80,21 @@ class LocalReference(BaseLocalReference):
 
 
 ConfigIdentityReference = LocalReference
+
 IdentityReference = LocalReference
+
+
+@dataclass(frozen=True, slots=True)
+class IdentityReferences:
+    """Result of :func:`resolve_identity_references`.
+
+    ``references`` holds concrete paths, each with a ``domain.Resolution``;
+    ``unresolved`` holds token-bearing ``IdentityFile`` values as
+    ``unresolved_token`` items with their provenance (never LocalReferences).
+    """
+
+    references: tuple[LocalReference, ...]
+    unresolved: tuple[UnresolvedConfigItem, ...]
 
 
 def _first_nonempty_line(text: str) -> str | None:
@@ -101,7 +113,7 @@ def _has_unresolved_token(
         return True
     for item in unresolved_items:
         if (
-            item.reason == "unresolved_token"
+            item.reason == _UNRESOLVED_REASON
             and item.source_file == entry.source.file
             and item.source_line == entry.source.line
         ):
@@ -109,11 +121,84 @@ def _has_unresolved_token(
     return False
 
 
+def _collect_entries(doc: ConfigDocument) -> list[IdentityFileEntry | ResolvedIdentityFile]:
+    entries: list[IdentityFileEntry | ResolvedIdentityFile] = []
+    if hasattr(doc, "global_block") and hasattr(doc, "host_blocks"):
+        if doc.global_block is not None:
+            entries.extend(doc.global_block.identity_files)
+        for block in doc.host_blocks:
+            entries.extend(block.identity_files)
+    elif hasattr(doc, "identity_files"):
+        entries.extend(doc.identity_files)
+    return entries
+
+
+def _expand(raw: str, home_path: Path | None, ssh_dir_path: Path | None) -> Path:
+    if raw == "~" and home_path is not None:
+        candidate = home_path
+    elif raw.startswith("~/") and home_path is not None:
+        candidate = home_path / raw[2:]
+    elif raw.startswith("~"):
+        candidate = Path(os.path.expanduser(raw))
+    elif os.path.isabs(raw):
+        candidate = Path(raw)
+    else:
+        base_dir = (
+            ssh_dir_path
+            if ssh_dir_path is not None
+            else (home_path / ".ssh" if home_path is not None else Path.cwd())
+        )
+        candidate = base_dir / raw
+    return Path(os.path.normpath(candidate))
+
+
+def _classify_pub(resolved_pub: Path) -> tuple[Resolution, str | None]:
+    """Read ``<ref>.pub`` (inside the root) through the safe reader only."""
+    try:
+        key_line = _first_nonempty_line(fs.read_public_text(resolved_pub))
+    except PrivateKeyAccessDenied:
+        return Resolution.PRIVATE_ONLY, None
+    except (OSError, NotAPublicKeyFile):
+        return Resolution.UNREADABLE, None
+    return Resolution.RESOLVED, key_line
+
+
+def _classify_private(home_path: Path, private_path: Path) -> Resolution:
+    """No ``.pub``: classify ``<ref>`` itself by stat only, never open (SEC-001)."""
+    resolved_ref, ref_resolution = fs.resolve_within(home_path, private_path)
+    if ref_resolution is not Resolution.RESOLVED:
+        return ref_resolution  # outside_root or missing
+    try:
+        st = os.stat(resolved_ref)
+    except FileNotFoundError:
+        return Resolution.MISSING
+    except OSError:
+        return Resolution.UNREADABLE
+    if stat.S_ISREG(st.st_mode):
+        return Resolution.PRIVATE_ONLY
+    return Resolution.UNREADABLE
+
+
+def _classify(home_path: Path, normalized_path: Path) -> tuple[Resolution, str | None]:
+    """FR-002: ``<ref>.pub`` decides first; the private path only matters without it."""
+    if normalized_path.name.endswith(".pub"):
+        pub_candidate = normalized_path
+    else:
+        pub_candidate = normalized_path.with_name(normalized_path.name + ".pub")
+
+    resolved_pub, pub_resolution = fs.resolve_within(home_path, pub_candidate)
+    if pub_resolution is Resolution.OUTSIDE_ROOT:
+        return Resolution.OUTSIDE_ROOT, None
+    if pub_resolution is Resolution.RESOLVED:
+        return _classify_pub(resolved_pub)
+    return _classify_private(home_path, normalized_path), None
+
+
 def resolve_identity_references(
     config_tree: ConfigDocument | str | os.PathLike[str],
     home: str | os.PathLike[str] | None = None,
     ssh_dir: str | os.PathLike[str] | None = None,
-) -> list[LocalReference]:
+) -> IdentityReferences:
     """Resolve IdentityFile references from a parsed ssh_config document (FR-002).
 
     Parameters:
@@ -121,6 +206,9 @@ def resolve_identity_references(
         home: The user's home directory (scan root for references). Defaults to ``$HOME``.
         ssh_dir: The directory used to resolve relative IdentityFile arguments.
                  Defaults to ``home / .ssh``.
+
+    Returns an :class:`IdentityReferences`: concrete ``references`` (each with
+    a ``domain.Resolution``) and token-bearing values as ``unresolved`` items.
     """
     if isinstance(config_tree, (str, os.PathLike)):
         doc = ssh_config.parse_file(config_tree)
@@ -131,196 +219,66 @@ def resolve_identity_references(
     home_path = Path(os.path.realpath(home_str)) if home_str else None
 
     if ssh_dir is not None:
-        ssh_dir_path = Path(os.path.realpath(os.fspath(ssh_dir)))
+        ssh_dir_path: Path | None = Path(os.path.realpath(os.fspath(ssh_dir)))
     elif home_path is not None:
         ssh_dir_path = home_path / ".ssh"
     else:
         ssh_dir_path = None
 
-    entries: list[IdentityFileEntry | ResolvedIdentityFile] = []
-    if hasattr(doc, "global_block") and hasattr(doc, "host_blocks"):
-        if doc.global_block is not None:
-            entries.extend(doc.global_block.identity_files)
-        for block in doc.host_blocks:
-            entries.extend(block.identity_files)
-    elif hasattr(doc, "identity_files"):
-        entries.extend(doc.identity_files)
-
     unresolved_items: Sequence[UnresolvedConfigItem] = getattr(doc, "unresolved", ())
 
     references: list[LocalReference] = []
+    unresolved: list[UnresolvedConfigItem] = []
 
-    for entry in entries:
+    for entry in _collect_entries(doc):
         raw = entry.path.strip()
         if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
             raw = raw[1:-1]
 
-        # 1. Unresolved token check (%h, %r, %d, %u, ${VAR})
+        # 1. Unexpanded token (%h, %r, %d, %u, ${VAR}): an unresolved item, not a reference.
         if _has_unresolved_token(entry, unresolved_items):
-            references.append(
-                LocalReference(
-                    kind=LocalReferenceKind.CONFIG_IDENTITY,
-                    path=entry.path,
+            unresolved.append(
+                UnresolvedConfigItem(
+                    reason=_UNRESOLVED_REASON,
+                    detail=entry.path,
                     source_file=entry.source.file,
                     source_line=entry.source.line,
-                    resolution=cast(Resolution, IdentityResolution.UNRESOLVED),
                 )
             )
             continue
 
-        # 2. ~ without HOME
+        public_key_text: str | None = None
         if raw.startswith("~") and home_path is None:
-            references.append(
-                LocalReference(
-                    kind=LocalReferenceKind.CONFIG_IDENTITY,
-                    path=entry.path,
-                    source_file=entry.source.file,
-                    source_line=entry.source.line,
-                    resolution=Resolution.UNREADABLE,
-                )
-            )
-            continue
-
-        # 3. Path expansion
-        if raw == "~" and home_path is not None:
-            candidate = home_path
-        elif raw.startswith("~/") and home_path is not None:
-            candidate = home_path / raw[2:]
-        elif raw.startswith("~") and home_path is not None:
-            candidate = Path(os.path.expanduser(raw))
-        elif os.path.isabs(raw):
-            candidate = Path(raw)
+            # 2. ~ without HOME cannot be expanded.
+            path_str, resolution = entry.path, Resolution.UNREADABLE
         else:
-            base_dir = (
-                ssh_dir_path
-                if ssh_dir_path is not None
-                else (home_path / ".ssh" if home_path is not None else Path.cwd())
-            )
-            candidate = base_dir / raw
-
-        normalized_path = Path(os.path.normpath(candidate))
-
-        # 4. Check if path is outside root (HOME)
-        if home_path is None:
-            references.append(
-                LocalReference(
-                    kind=LocalReferenceKind.CONFIG_IDENTITY,
-                    path=str(normalized_path),
-                    source_file=entry.source.file,
-                    source_line=entry.source.line,
-                    resolution=Resolution.OUTSIDE_ROOT,
-                )
-            )
-            continue
-
-        _, within_status = fs.resolve_within(home_path, normalized_path)
-        if within_status is Resolution.OUTSIDE_ROOT:
-            references.append(
-                LocalReference(
-                    kind=LocalReferenceKind.CONFIG_IDENTITY,
-                    path=str(normalized_path),
-                    source_file=entry.source.file,
-                    source_line=entry.source.line,
-                    resolution=Resolution.OUTSIDE_ROOT,
-                )
-            )
-            continue
-
-        # 5. Check for <ref>.pub
-        if normalized_path.name.endswith(".pub"):
-            pub_candidate = normalized_path
-        else:
-            pub_candidate = normalized_path.with_name(normalized_path.name + ".pub")
-
-        resolved_pub, pub_resolution = fs.resolve_within(home_path, pub_candidate)
-        if pub_resolution is Resolution.OUTSIDE_ROOT:
-            references.append(
-                LocalReference(
-                    kind=LocalReferenceKind.CONFIG_IDENTITY,
-                    path=str(normalized_path),
-                    source_file=entry.source.file,
-                    source_line=entry.source.line,
-                    resolution=Resolution.OUTSIDE_ROOT,
-                )
-            )
-            continue
-
-        if pub_resolution is Resolution.RESOLVED:
-            try:
-                pub_text = fs.read_public_text(resolved_pub)
-                key_line = _first_nonempty_line(pub_text)
-                references.append(
-                    LocalReference(
-                        kind=LocalReferenceKind.CONFIG_IDENTITY,
-                        path=str(normalized_path),
-                        source_file=entry.source.file,
-                        source_line=entry.source.line,
-                        resolution=Resolution.RESOLVED,
-                        public_key_text=key_line,
-                        key_line=key_line,
-                    )
-                )
-                continue
-            except PrivateKeyAccessDenied:
-                references.append(
-                    LocalReference(
-                        kind=LocalReferenceKind.CONFIG_IDENTITY,
-                        path=str(normalized_path),
-                        source_file=entry.source.file,
-                        source_line=entry.source.line,
-                        resolution=Resolution.PRIVATE_ONLY,
-                    )
-                )
-                continue
-            except (OSError, NotAPublicKeyFile):
-                references.append(
-                    LocalReference(
-                        kind=LocalReferenceKind.CONFIG_IDENTITY,
-                        path=str(normalized_path),
-                        source_file=entry.source.file,
-                        source_line=entry.source.line,
-                        resolution=Resolution.UNREADABLE,
-                    )
-                )
-                continue
-
-        # 6. No .pub file exists; check <ref> itself without opening (SEC-001).
-        resolved_ref, ref_resolution = fs.resolve_within(home_path, normalized_path)
-        if ref_resolution is Resolution.MISSING:
-            resolution = Resolution.MISSING
-        else:
-            try:
-                st = os.stat(resolved_ref)
-                if stat.S_ISDIR(st.st_mode):
-                    resolution = Resolution.UNREADABLE
-                elif stat.S_ISREG(st.st_mode):
-                    resolution = Resolution.PRIVATE_ONLY
-                else:
-                    resolution = Resolution.UNREADABLE
-            except FileNotFoundError:
-                resolution = Resolution.MISSING
-            except PermissionError:
-                resolution = Resolution.UNREADABLE
-            except OSError:
-                resolution = Resolution.UNREADABLE
+            normalized_path = _expand(raw, home_path, ssh_dir_path)
+            path_str = str(normalized_path)
+            if home_path is None:
+                # 3. No scan root at all: nothing can be shown to lie inside it.
+                resolution = Resolution.OUTSIDE_ROOT
+            else:
+                resolution, public_key_text = _classify(home_path, normalized_path)
 
         references.append(
             LocalReference(
                 kind=LocalReferenceKind.CONFIG_IDENTITY,
-                path=str(normalized_path),
+                path=path_str,
                 source_file=entry.source.file,
                 source_line=entry.source.line,
                 resolution=resolution,
+                public_key_text=public_key_text,
+                key_line=public_key_text,
             )
         )
 
-    return references
+    return IdentityReferences(references=tuple(references), unresolved=tuple(unresolved))
 
 
 __all__ = [
     "ConfigIdentityReference",
     "IdentityReference",
-    "IdentityResolution",
+    "IdentityReferences",
     "LocalReference",
     "resolve_identity_references",
 ]

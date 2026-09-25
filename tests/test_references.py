@@ -4,10 +4,15 @@ Covers AC-1..AC-3 of SID-7 plus security edge cases:
 - AC-1: test_reference_with_pub_is_resolved
 - AC-2: test_private_only_and_missing_without_opening_private_key
 - AC-3: test_outside_root_and_token_references
+- Resolution contract (§7.3): test_every_resolution_is_a_domain_resolution
+- .pub inside HOME wins over private symlink outside HOME:
+  test_private_symlink_outside_home_does_not_hide_pub_inside_home
 """
 
 from __future__ import annotations
 
+import builtins
+import io
 import os
 from pathlib import Path
 from typing import Any
@@ -17,11 +22,11 @@ import pytest
 from conftest import CANARY, CANARY_PRIVATE_KEY, OpenGuard
 from ssh_id_doctor.domain import LocalReferenceKind, Resolution
 from ssh_id_doctor.references import (
-    IdentityResolution,
+    IdentityReferences,
     LocalReference,
     resolve_identity_references,
 )
-from ssh_id_doctor.ssh_config import parse_file
+from ssh_id_doctor.ssh_config import UnresolvedConfigItem, parse_file
 
 
 def test_reference_with_pub_is_resolved(fake_home: Path, open_guard: OpenGuard) -> None:
@@ -34,7 +39,7 @@ def test_reference_with_pub_is_resolved(fake_home: Path, open_guard: OpenGuard) 
     config_content = "Host work\n  HostName work.example.com\n  IdentityFile ~/.ssh/id_work\n"
     (ssh / "config").write_text(config_content)
 
-    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh)
+    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh).references
 
     assert len(refs) == 1
     ref = refs[0]
@@ -68,7 +73,7 @@ def test_private_only_and_missing_without_opening_private_key(
     )
     (ssh / "config").write_text(config_content)
 
-    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh)
+    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh).references
 
     assert len(refs) == 2
     canary_ref, gone_ref = refs
@@ -97,7 +102,11 @@ def test_private_only_and_missing_without_opening_private_key(
 def test_outside_root_and_token_references(
     fake_home: Path, open_guard: OpenGuard, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AC-3: path outside HOME is outside_root without stat; token path is unresolved."""
+    """AC-3: path outside HOME is outside_root without stat; token path is an unresolved item.
+
+    A token reference is not a LocalReference at all (sdd-spec §7.3 allows only
+    five resolutions): it becomes an ``unresolved_token`` item with provenance.
+    """
     ssh = fake_home / ".ssh"
     config_content = (
         "Host example\n  IdentityFile /etc/ssh/ssh_host_ed25519_key\n  IdentityFile ~/.ssh/%h_key\n"
@@ -113,25 +122,132 @@ def test_outside_root_and_token_references(
 
     monkeypatch.setattr(os, "stat", recording_stat)
 
-    refs = resolve_identity_references(ssh / "config", ssh_dir=ssh)
+    result = resolve_identity_references(ssh / "config", ssh_dir=ssh)
 
-    assert len(refs) == 2
-    outside_ref, token_ref = refs
-
+    assert isinstance(result, IdentityReferences)
+    assert len(result.references) == 1
+    outside_ref = result.references[0]
     assert outside_ref.kind is LocalReferenceKind.CONFIG_IDENTITY
     assert outside_ref.resolution is Resolution.OUTSIDE_ROOT
     assert outside_ref.path == "/etc/ssh/ssh_host_ed25519_key"
+    assert outside_ref.source_line == 2
     assert outside_ref.public_key_text is None
 
-    assert token_ref.kind is LocalReferenceKind.CONFIG_IDENTITY
-    assert token_ref.resolution == "unresolved"
-    assert token_ref.resolution == IdentityResolution.UNRESOLVED
-    assert token_ref.resolution is IdentityResolution.UNRESOLVED
-    assert token_ref.path == "~/.ssh/%h_key"
-    assert token_ref.public_key_text is None
+    assert result.unresolved == (
+        UnresolvedConfigItem(
+            reason="unresolved_token",
+            detail="~/.ssh/%h_key",
+            source_file=str((ssh / "config").resolve()),
+            source_line=3,
+        ),
+    )
+    assert not any("%h" in ref.path for ref in result.references)
 
     assert not any("ssh_host_ed25519_key" in call for call in stat_calls)
     assert not any("%h" in call for call in stat_calls)
+    assert open_guard.violations == []
+
+
+def test_every_resolution_is_a_domain_resolution(fake_home: Path, open_guard: OpenGuard) -> None:
+    """Every LocalReference.resolution is a member of domain.Resolution (sdd-spec §7.3)."""
+    ssh = fake_home / ".ssh"
+    (ssh / "id_work").write_text("priv\n")
+    (ssh / "id_work.pub").write_text("ssh-ed25519 AAAAC3work work@test\n")
+    (ssh / "dir_key").mkdir()
+    (ssh / "config").write_text(
+        "Host all\n"
+        "  IdentityFile ~/.ssh/id_work\n"
+        "  IdentityFile ~/.ssh/id_canary\n"
+        "  IdentityFile ~/.ssh/gone\n"
+        "  IdentityFile ~/.ssh/dir_key\n"
+        "  IdentityFile /etc/ssh/ssh_host_ed25519_key\n"
+        "  IdentityFile ~/.ssh/%r_key\n"
+        "  IdentityFile ~/.ssh/${KEYNAME}\n"
+        "  IdentityFile ~/.ssh/%d/%u\n"
+    )
+
+    result = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh)
+
+    assert len(result.references) == 5
+    for ref in result.references:
+        assert type(ref.resolution) is Resolution
+        assert ref.resolution in set(Resolution)
+    assert [item.reason for item in result.unresolved] == ["unresolved_token"] * 3
+    assert [item.source_line for item in result.unresolved] == [7, 8, 9]
+    assert open_guard.violations == []
+
+
+def test_private_symlink_outside_home_does_not_hide_pub_inside_home(
+    fake_home: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    open_guard: OpenGuard,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-002: <ref>.pub inside HOME wins over a private <ref> symlinked outside HOME.
+
+    The private symlink target lies outside the synthetic HOME, where the
+    autouse guard does not look, so this test guards it explicitly.
+    """
+    outside = tmp_path_factory.mktemp("outside_private")
+    outside_key = outside / "id_work_real"
+    outside_key.write_text(CANARY_PRIVATE_KEY)
+    outside_real = os.path.realpath(outside_key)
+
+    ssh = fake_home / ".ssh"
+    (ssh / "id_work").symlink_to(outside_key)
+    expected_pub = "ssh-ed25519 AAAAC3symlinked work@test"
+    (ssh / "id_work.pub").write_text(f"{expected_pub}\n")
+    (ssh / "config").write_text("Host work\n  IdentityFile ~/.ssh/id_work\n")
+
+    outside_opens: list[str] = []
+
+    def touches_outside(file: Any) -> bool:
+        if isinstance(file, int) or not isinstance(file, str | bytes | os.PathLike):
+            return False
+        return os.path.realpath(os.fsdecode(os.fspath(file))) == outside_real
+
+    def wrap(real: Any) -> Any:
+        def wrapper(file: Any, *args: Any, **kwargs: Any) -> Any:
+            if touches_outside(file):
+                outside_opens.append(os.fsdecode(os.fspath(file)))
+            return real(file, *args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(builtins, "open", wrap(builtins.open))
+    monkeypatch.setattr(io, "open", wrap(io.open))
+    monkeypatch.setattr(os, "open", wrap(os.open))
+    monkeypatch.setattr(Path, "read_text", wrap(Path.read_text))
+    monkeypatch.setattr(Path, "read_bytes", wrap(Path.read_bytes))
+
+    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh).references
+
+    assert len(refs) == 1
+    ref = refs[0]
+    assert ref.resolution is Resolution.RESOLVED
+    assert ref.public_key_text == expected_pub
+    assert ref.source_line == 2
+    assert outside_opens == [], "private symlink target outside HOME was opened"
+    assert CANARY not in repr(refs)
+    assert open_guard.violations == []
+
+
+def test_private_outside_home_without_pub_is_outside_root(
+    fake_home: Path, tmp_path_factory: pytest.TempPathFactory, open_guard: OpenGuard
+) -> None:
+    """No <ref>.pub and a private <ref> symlinked outside HOME -> outside_root."""
+    outside = tmp_path_factory.mktemp("outside_private_only")
+    outside_key = outside / "id_lonely"
+    outside_key.write_text(CANARY_PRIVATE_KEY)
+
+    ssh = fake_home / ".ssh"
+    (ssh / "id_lonely").symlink_to(outside_key)
+    (ssh / "config").write_text("Host l\n  IdentityFile ~/.ssh/id_lonely\n")
+
+    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh).references
+
+    assert len(refs) == 1
+    assert refs[0].resolution is Resolution.OUTSIDE_ROOT
     assert open_guard.violations == []
 
 
@@ -148,7 +264,7 @@ def test_same_reference_across_multiple_hosts_has_distinct_provenance(
     )
     (ssh / "config").write_text(config_content)
 
-    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh)
+    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh).references
 
     assert len(refs) == 2
     assert refs[0].source_line == 2
@@ -178,7 +294,7 @@ def test_include_splices_references_with_real_source_loc(
     (ssh / "config").write_text("Include config.d/*.conf\n")
 
     doc = parse_file(ssh / "config")
-    refs = resolve_identity_references(doc, home=fake_home, ssh_dir=ssh)
+    refs = resolve_identity_references(doc, home=fake_home, ssh_dir=ssh).references
 
     assert len(refs) == 1
     ref = refs[0]
@@ -199,7 +315,7 @@ def test_pub_file_with_private_key_material_marked_private_only(
 
     (ssh / "config").write_text("Host bad\n  IdentityFile ~/.ssh/bad_pub\n")
 
-    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh)
+    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh).references
 
     assert len(refs) == 1
     ref = refs[0]
@@ -223,7 +339,7 @@ def test_pub_file_symlink_outside_root_marked_outside_root(
 
     (ssh / "config").write_text("Host ext\n  IdentityFile ~/.ssh/target_key\n")
 
-    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh)
+    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh).references
 
     assert len(refs) == 1
     assert refs[0].resolution is Resolution.OUTSIDE_ROOT
@@ -239,7 +355,7 @@ def test_pub_fifo_or_unreadable_marked_unreadable(fake_home: Path, open_guard: O
 
     (ssh / "config").write_text("Host pipe\n  IdentityFile ~/.ssh/pipe_key\n")
 
-    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh)
+    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh).references
 
     assert len(refs) == 1
     assert refs[0].resolution is Resolution.UNREADABLE
@@ -256,7 +372,7 @@ def test_directory_as_identity_file_marked_unreadable(
 
     (ssh / "config").write_text("Host d\n  IdentityFile ~/.ssh/dir_key\n")
 
-    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh)
+    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh).references
 
     assert len(refs) == 1
     assert refs[0].resolution is Resolution.UNREADABLE
@@ -274,7 +390,7 @@ def test_relative_identity_file_resolved_against_ssh_dir(
 
     (ssh / "config").write_text("Host r\n  IdentityFile rel_key\n")
 
-    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh)
+    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh).references
 
     assert len(refs) == 1
     ref = refs[0]
@@ -292,7 +408,7 @@ def test_quoted_path_with_spaces(fake_home: Path, open_guard: OpenGuard) -> None
 
     (ssh / "config").write_text('Host sp\n  IdentityFile "~/.ssh/my key"\n')
 
-    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh)
+    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh).references
 
     assert len(refs) == 1
     ref = refs[0]
@@ -308,7 +424,7 @@ def test_tilde_without_home_is_unreadable(tmp_path: Path, monkeypatch: pytest.Mo
     config_file = tmp_path / "config"
     config_file.write_text("Host nohome\n  IdentityFile ~/key\n")
 
-    refs = resolve_identity_references(config_file, home=None)
+    refs = resolve_identity_references(config_file, home=None).references
 
     assert len(refs) == 1
     assert refs[0].resolution is Resolution.UNREADABLE
@@ -326,7 +442,7 @@ def test_identity_outside_ssh_dir_but_inside_home_is_resolved(
     ssh = fake_home / ".ssh"
     (ssh / "config").write_text("Host deploy\n  IdentityFile ~/custom_keys/id_deploy\n")
 
-    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh)
+    refs = resolve_identity_references(ssh / "config", home=fake_home, ssh_dir=ssh).references
 
     assert len(refs) == 1
     ref = refs[0]
