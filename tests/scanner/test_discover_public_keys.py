@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import builtins
+import contextlib
 import io
 import logging
 import os
 import socket
+import stat
 import threading
 from pathlib import Path
 from typing import Any
@@ -91,7 +93,11 @@ def test_ignores_sockets_fifos_and_directories(fake_home: Path, open_guard: Open
     ssh = fake_home / ".ssh"
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        sock.bind(str(ssh / "agent.sock"))
+        # AF_UNIX paths are capped at 104 bytes on macOS and the tmp HOME is
+        # longer there, so bind by a relative name from inside the .ssh dir.
+        with contextlib.chdir(ssh):
+            sock.bind("agent.sock")
+        assert stat.S_ISSOCK((ssh / "agent.sock").lstat().st_mode)
         os.mkfifo(ssh / "pipe.pub")
 
         observations = scanner.discover_public_keys(ssh)
