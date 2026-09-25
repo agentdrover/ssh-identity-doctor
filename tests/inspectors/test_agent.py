@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shutil
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -303,10 +302,16 @@ def test_agent_missing_or_non_executable_ssh_add(
     assert res_not_exec.coverage.state == CoverageState.UNAVAILABLE
 
 
-def test_agent_missing_ssh_keygen_handled_gracefully(
+def test_agent_missing_ssh_keygen_raises_required_source_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If ssh-keygen is missing/broken, agent inspection does not crash the scan."""
+    """Finding 9b41523a: agent answered, ssh-keygen is missing -> RequiredSourceError.
+
+    ssh-keygen is a REQUIRED source (SID-4, exit 2); the agent is optional. When
+    the agent does list keys but they cannot be fingerprinted, the failure
+    belongs to ssh-keygen and must propagate, not be masked as an unavailable
+    agent.
+    """
     recorded = _fixture_text("two_keys")
 
     def fake_run(argv: Sequence[str], *, timeout: float, max_output: int) -> ProcessResult:
@@ -325,11 +330,8 @@ def test_agent_missing_ssh_keygen_handled_gracefully(
             raise RequiredSourceError("ssh-keygen is not installed or not on PATH")
 
     adapter = SSHAgentAdapter(keygen=BrokenKeygen())
-    result = adapter.list_identities()
-
-    assert result.state is AgentState.UNAVAILABLE
-    assert result.coverage.state == CoverageState.UNAVAILABLE
-    assert "ssh-keygen" in result.detail
+    with pytest.raises(RequiredSourceError, match="ssh-keygen"):
+        adapter.list_identities()
 
 
 def test_agent_truncated_output_reported_in_detail(
@@ -352,14 +354,68 @@ def test_agent_truncated_output_reported_in_detail(
     assert "(truncated)" in result.detail
 
 
-def test_agent_live_query_when_available() -> None:
-    """In test environment with unset SSH_AUTH_SOCK, live query cleanly returns UNAVAILABLE."""
-    if shutil.which("ssh-add") is None:
-        pytest.skip("ssh-add not installed in environment")
+def test_agent_without_socket_is_unavailable_from_recorded_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 90d3d23a: no agent socket, on RECORDED ssh-add output (no live call).
 
-    adapter = SSHAgentAdapter()
-    result = adapter.list_identities()
+    Replaces the former live query. Recorded from OpenSSH with SSH_AUTH_SOCK
+    unset: exit 2 and the reason on stderr. The state is unavailable and the
+    reason reaches the coverage detail, so the report can say why.
+    """
+    stderr = (FIXTURES / "no_socket.stderr").read_bytes()
+    calls: list[list[str]] = []
 
-    # With no agent running/connected, ssh-add exits 2
+    def fake_run(argv: Sequence[str], *, timeout: float, max_output: int) -> ProcessResult:
+        calls.append(list(argv))
+        return ProcessResult(ProcessStatus.NONZERO, 2, b"", stderr, False)
+
+    monkeypatch.setattr("ssh_id_doctor.inspectors.agent.process.run", fake_run)
+
+    result = SSHAgentAdapter().list_identities()
+
+    assert calls == [["ssh-add", "-L"]]
     assert result.state is AgentState.UNAVAILABLE
     assert result.coverage.state == CoverageState.UNAVAILABLE
+    assert "Could not open a connection to your authentication agent" in result.detail
+    assert result.coverage.detail == result.detail
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_agent_empty_needs_exit_1_and_no_identities_phrase(
+    monkeypatch: pytest.MonkeyPatch, stream: str
+) -> None:
+    """Exit 1 plus 'The agent has no identities.' on either stream -> available_empty."""
+    phrase = b"The agent has no identities.\n"
+    out, err = (phrase, b"") if stream == "stdout" else (b"", phrase)
+    monkeypatch.setattr(
+        "ssh_id_doctor.inspectors.agent.process.run",
+        lambda *a, **k: ProcessResult(ProcessStatus.NONZERO, 1, out, err, False),
+    )
+
+    result = SSHAgentAdapter().list_identities()
+
+    assert result.state is AgentState.AVAILABLE_EMPTY
+    assert result.coverage.state == CoverageState.EMPTY
+
+
+def test_agent_exit_1_with_other_error_is_unavailable_not_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 17500542: exit 1 without the phrase is a failed listing, not an empty agent.
+
+    Classified unavailable (reason kept), not malformed_output: nothing was
+    listed, so there is no output to be malformed; the agent could not be read.
+    """
+    stderr = b"error fetching identities: communication with agent failed\n"
+    monkeypatch.setattr(
+        "ssh_id_doctor.inspectors.agent.process.run",
+        lambda *a, **k: ProcessResult(ProcessStatus.NONZERO, 1, b"", stderr, False),
+    )
+
+    result = SSHAgentAdapter().list_identities()
+
+    assert result.state is AgentState.UNAVAILABLE
+    assert result.coverage.state == CoverageState.UNAVAILABLE
+    assert "communication with agent failed" in result.detail
+    assert "exit 1" in result.detail

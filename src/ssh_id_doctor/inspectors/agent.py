@@ -7,10 +7,16 @@ each reported public identity line into a canonical :class:`Identity` using
 
 The adapter distinguishes five states (§5.3 note, FR-005, §12):
 - ``available_with_identities``: agent returned one or more valid identities;
-- ``available_empty``: agent is running but holds no keys (exit 1);
-- ``unavailable``: agent socket missing/inaccessible or ssh-add absent (exit 2);
+- ``available_empty``: agent is running but holds no keys (exit 1 and
+  "The agent has no identities.");
+- ``unavailable``: agent socket missing/inaccessible or ssh-add absent (exit 2),
+  or any other failed listing (exit 1 without the no-identities phrase);
 - ``timeout``: subprocess timed out;
 - ``malformed_output``: process exited 0 but produced unparseable output.
+
+A missing ssh-keygen is NOT an agent state: :class:`RequiredSourceError`
+propagates, because ssh-keygen is a required source (exit 2) and the agent
+is optional.
 
 Every call is read-only (SEC-002/SEC-006: never passing mutating flags like
 ``-d`` or ``-D``) and failures never crash the scan, reflecting instead in
@@ -24,7 +30,7 @@ from enum import StrEnum
 
 from ssh_id_doctor import process
 from ssh_id_doctor.domain import CoverageState, Identity, SourceCoverage
-from ssh_id_doctor.inspectors import RequiredSourceError, Unresolved
+from ssh_id_doctor.inspectors import Unresolved
 from ssh_id_doctor.inspectors.keygen import DEFAULT_TIMEOUT, KeyInfo, PublicKeyInspector
 from ssh_id_doctor.process import ProcessStatus
 
@@ -93,6 +99,31 @@ def _extract_comments(line: str, key_info: KeyInfo) -> tuple[str, ...]:
     return ()
 
 
+_NO_IDENTITIES = "The agent has no identities."
+
+
+def _nonzero_result(result: process.ProcessResult) -> AgentResult:
+    """Classify a nonzero ``ssh-add -L`` exit.
+
+    Exit 1 is empty only together with the ``_NO_IDENTITIES`` phrase (stdout or
+    stderr). Any other exit 1 is a failed listing (agent refused, protocol
+    error): unavailable with the reason, not malformed_output, because no
+    listing was produced that could be malformed. Exit 2 means no agent.
+    """
+    stdout_text = result.stdout.decode("utf-8", errors="replace")
+    stderr_text = result.stderr.decode("utf-8", errors="replace").strip()
+    if result.returncode == 1:
+        if _NO_IDENTITIES in stdout_text or _NO_IDENTITIES in stderr_text:
+            return AgentResult(state=AgentState.AVAILABLE_EMPTY, detail="agent has no identities")
+        reason = stderr_text or stdout_text.strip() or "no message"
+        return AgentResult(
+            state=AgentState.UNAVAILABLE,
+            detail=f"ssh-add -L failed with exit 1: {reason}",
+        )
+    detail = stderr_text if stderr_text else f"ssh-add exited with code {result.returncode}"
+    return AgentResult(state=AgentState.UNAVAILABLE, detail=detail)
+
+
 class SSHAgentAdapter:
     """Inspects public identities currently offered by the SSH agent (FR-005)."""
 
@@ -130,17 +161,7 @@ class SSHAgentAdapter:
             )
 
         if result.status is ProcessStatus.NONZERO:
-            if result.returncode == 1:
-                return AgentResult(
-                    state=AgentState.AVAILABLE_EMPTY,
-                    detail="agent has no identities",
-                )
-            stderr_text = result.stderr.decode("utf-8", errors="replace").strip()
-            detail = stderr_text if stderr_text else f"ssh-add exited with code {result.returncode}"
-            return AgentResult(
-                state=AgentState.UNAVAILABLE,
-                detail=detail,
-            )
+            return _nonzero_result(result)
 
         stdout_text = result.stdout.decode("utf-8", errors="replace")
         lines = [line.strip() for line in stdout_text.splitlines() if line.strip()]
@@ -155,14 +176,10 @@ class SSHAgentAdapter:
         unresolved: list[Unresolved] = []
 
         for line in lines:
-            try:
-                info = self._keygen.fingerprint(line)
-            except RequiredSourceError as err:
-                return AgentResult(
-                    state=AgentState.UNAVAILABLE,
-                    detail=f"ssh-keygen unavailable: {err}",
-                )
-
+            # RequiredSourceError (ssh-keygen missing/hung) propagates on purpose:
+            # ssh-keygen is a required source (exit 2), the agent is not. Masking
+            # it as an unavailable agent would blame the wrong source.
+            info = self._keygen.fingerprint(line)
             if isinstance(info, KeyInfo):
                 comments = _extract_comments(line, info)
                 identities.append(
