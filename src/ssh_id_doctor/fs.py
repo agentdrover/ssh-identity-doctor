@@ -5,11 +5,19 @@ directory entries and resolves symlinks, and an entry whose real location is
 outside the scan root is reported as ``outside_root`` and not descended into.
 Nothing here changes permissions or timestamps.
 
-:func:`read_public_text` is the single reading function. It refuses, by name
-and before any ``open``, every path that is not a ``.pub`` file (including a
-``.pub`` symlink whose target is not one), and it refuses a ``.pub`` file that
-holds a private-key header on any line — not just the first — since a private
-key can be renamed to look public with an unrelated line prepended.
+:func:`read_public_text` is the single reading function for public keys. It
+refuses, by name and before any ``open``, every path that is not a ``.pub``
+file (including a ``.pub`` symlink whose target is not one), and it refuses a
+``.pub`` file that holds a private-key header on any line — not just the
+first — since a private key can be renamed to look public with an unrelated
+line prepended.
+
+:func:`read_config_text` is the analogous single reading function for one
+ssh_config(5) file (FR-004a, §10 SEC-001/SEC-003): it refuses — before any
+``open`` — a target that is not a regular file (a config path is usually
+literally named ``config``, so unlike public keys there is no name check),
+refuses content over a size limit, and refuses (after reading) content
+holding a private-key header on any line.
 """
 
 from __future__ import annotations
@@ -27,6 +35,9 @@ PUBLIC_SUFFIX = ".pub"
 MAX_PUBLIC_BYTES = 64 * 1024
 """A public key is a single short line; anything larger is not one."""
 
+MAX_CONFIG_BYTES = 1024 * 1024
+"""An ssh_config(5) file is plain text with a modest line count; larger is refused (AC-4)."""
+
 _PRIVATE_MARKERS: tuple[bytes, ...] = (
     b"openssh-key-v1",
     b"b3BlbnNzaC1rZXktdjE",  # base64 of "openssh-key-v1"
@@ -41,6 +52,13 @@ class NotAPublicKeyFile(ValueError):
     """A ``.pub`` path that cannot hold a public key: not a regular file, or too large.
 
     Callers record such a path as unresolved instead of aborting a scan.
+    """
+
+
+class NotAConfigFile(ValueError):
+    """A config path that cannot hold an ssh_config(5) file: not a regular file, or too large.
+
+    Callers record such a path as unresolved instead of aborting a scan (AC-4).
     """
 
 
@@ -162,4 +180,36 @@ def read_public_text(path: str | os.PathLike[str], *, max_bytes: int = MAX_PUBLI
         raise PrivateKeyAccessDenied(f"{normalized.name!r} holds private-key material")
     if len(data) > max_bytes:
         raise NotAPublicKeyFile(f"{normalized.name!r} exceeds {max_bytes} bytes; not a public key")
+    return data.decode("utf-8", errors="replace")
+
+
+def read_config_text(path: str | os.PathLike[str], *, max_bytes: int = MAX_CONFIG_BYTES) -> str:
+    """Read one ssh_config(5) file. One of two functions in the package that opens a file.
+
+    Unlike :func:`read_public_text` there is no filename check (a config file
+    is usually literally named ``config``, not suffixed). A target that is
+    not a regular file (FIFO, socket, device — including one reached through
+    a symlink, per review lessons on SID-3) is refused with
+    :class:`NotAConfigFile` before any ``open``, as is content over
+    ``max_bytes``. Content holding a private-key header on any line is
+    refused with :class:`PrivateKeyAccessDenied` after reading, same as a
+    public key (SEC-001: a config can name a real key path but must never
+    carry one inline). The message names the file only by its base name and
+    never quotes file content.
+    """
+    normalized = _normalize(path)
+    real = Path(os.path.realpath(normalized))
+    if not stat.S_ISREG(os.stat(real).st_mode):
+        raise NotAConfigFile(f"{normalized.name!r} is not a regular file")
+    # O_NONBLOCK: should the path be swapped for a FIFO after the check above,
+    # the open still returns at once and the fstat below refuses it.
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+    with os.fdopen(os.open(real, flags), "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise NotAConfigFile(f"{normalized.name!r} is not a regular file")
+        data = handle.read(max_bytes + 1)
+    if looks_like_private_key(data):
+        raise PrivateKeyAccessDenied(f"{normalized.name!r} holds private-key material")
+    if len(data) > max_bytes:
+        raise NotAConfigFile(f"{normalized.name!r} exceeds {max_bytes} bytes; not a config file")
     return data.decode("utf-8", errors="replace")
