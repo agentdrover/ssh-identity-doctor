@@ -7,8 +7,9 @@ Nothing here changes permissions or timestamps.
 
 :func:`read_public_text` is the single reading function. It refuses, by name
 and before any ``open``, every path that is not a ``.pub`` file (including a
-``.pub`` symlink whose target is not one), and it refuses a ``.pub`` file whose
-first line is a private-key header — a private key renamed to look public.
+``.pub`` symlink whose target is not one), and it refuses a ``.pub`` file that
+holds a private-key header on any line — not just the first — since a private
+key can be renamed to look public with an unrelated line prepended.
 """
 
 from __future__ import annotations
@@ -113,11 +114,16 @@ def safe_walk(root: str | os.PathLike[str]) -> Iterator[WalkEntry]:
         pending.extend(reversed(subdirs))
 
 
-def looks_like_private_key(first_line: bytes) -> bool:
-    line = first_line.strip()
-    if line.startswith(b"-----BEGIN") and b"PRIVATE KEY" in line:
+def looks_like_private_key(data: bytes) -> bool:
+    """True if any line of ``data`` carries a private-key header or marker."""
+    return any(_is_private_key_line(line) for line in data.split(b"\n"))
+
+
+def _is_private_key_line(line: bytes) -> bool:
+    stripped = line.strip()
+    if stripped.startswith(b"-----BEGIN") and b"PRIVATE KEY" in stripped:
         return True
-    return any(line.startswith(marker) for marker in _PRIVATE_MARKERS)
+    return any(stripped.startswith(marker) for marker in _PRIVATE_MARKERS)
 
 
 def read_public_text(path: str | os.PathLike[str], *, max_bytes: int = MAX_PUBLIC_BYTES) -> str:
@@ -125,8 +131,9 @@ def read_public_text(path: str | os.PathLike[str], *, max_bytes: int = MAX_PUBLI
 
     Refuses with :class:`PrivateKeyAccessDenied` — before opening — any path
     whose name, or whose symlink target's name, lacks the ``.pub`` suffix; and,
-    after reading the first line, a ``.pub`` file holding a private-key header.
-    The message names the file only by its base name.
+    after reading the content, a ``.pub`` file holding a private-key header on
+    any line (not just the first). The message names the file only by its base
+    name and never quotes file content.
     """
     normalized = _normalize(path)
     real = Path(os.path.realpath(normalized))
@@ -134,7 +141,7 @@ def read_public_text(path: str | os.PathLike[str], *, max_bytes: int = MAX_PUBLI
         raise PrivateKeyAccessDenied(f"refusing to read non-.pub file {normalized.name!r}")
     with open(real, "rb") as handle:
         data = handle.read(max_bytes + 1)
-    if looks_like_private_key(data.split(b"\n", 1)[0]):
+    if looks_like_private_key(data):
         raise PrivateKeyAccessDenied(f"{normalized.name!r} holds private-key material")
     if len(data) > max_bytes:
         raise ValueError(f"{normalized.name!r} exceeds {max_bytes} bytes; not a public key")
