@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import builtins
+import io
 import logging
 import os
 import socket
+import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -37,6 +41,28 @@ def read_spy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         return original(path, *args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(fs, "read_public_text", spy)
+    return calls
+
+
+@pytest.fixture
+def opened_paths(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Real path of every open (any route, any mode), layered over the private-open guard."""
+    calls: list[str] = []
+    inner_open = builtins.open
+    inner_os_open = os.open
+
+    def recording_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(file, str | bytes | os.PathLike):
+            calls.append(os.path.realpath(os.fsdecode(os.fspath(file))))
+        return inner_open(file, *args, **kwargs)
+
+    def recording_os_open(path: Any, *args: Any, **kwargs: Any) -> int:
+        calls.append(os.path.realpath(os.fsdecode(os.fspath(path))))
+        return inner_os_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", recording_open)
+    monkeypatch.setattr(io, "open", recording_open)
+    monkeypatch.setattr(os, "open", recording_os_open)
     return calls
 
 
@@ -155,4 +181,62 @@ def test_pub_symlink_outside_root_is_never_read(
     assert by_name["leak.pub"].key_line is None
     assert str(os.path.realpath(leaked)) not in read_spy
     assert not any(o.key_line == leaked_text.strip() for o in observations)
+    assert open_guard.violations == []
+
+
+def test_pub_symlink_to_fifo_inside_root_is_unreadable_without_open(
+    fake_home: Path, opened_paths: list[str], open_guard: OpenGuard
+) -> None:
+    """Review #562 finding 466094cf: alias.pub -> pipe.pub (FIFO, inside root) must not hang."""
+    ssh = fake_home / ".ssh"
+    fifo = ssh / "pipe.pub"
+    os.mkfifo(fifo)
+    (ssh / "alias.pub").symlink_to(fifo)
+
+    result: list[list[scanner.PublicKeyObservation]] = []
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            result.append(scanner.discover_public_keys(ssh))
+        except BaseException as exc:  # surfaced in the main thread below
+            errors.append(exc)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+    if worker.is_alive():
+        # Release the blocked reader so the thread (and CI) does not hang.
+        writer = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        os.close(writer)
+        worker.join(timeout=5)
+        pytest.fail("discover_public_keys blocked opening a FIFO behind a .pub symlink")
+    assert errors == []
+
+    by_name = {Path(o.path).name: o for o in result[0]}
+    assert by_name["alias.pub"].resolution is Resolution.UNREADABLE
+    assert by_name["alias.pub"].key_line is None
+    assert "pipe.pub" not in by_name
+    assert by_name["id_canary.pub"].resolution is Resolution.RESOLVED
+    assert os.path.realpath(fifo) not in opened_paths
+    assert open_guard.violations == []
+
+
+def test_oversized_pub_is_unreadable_and_scan_continues(
+    fake_home: Path, open_guard: OpenGuard
+) -> None:
+    """Review #562 finding dbb72cc2: a .pub over MAX_PUBLIC_BYTES is unresolved, not a crash."""
+    ssh = fake_home / ".ssh"
+    huge = ssh / "huge.pub"
+    huge.write_text("ssh-ed25519 " + "A" * (fs.MAX_PUBLIC_BYTES + 1024) + " huge\n")
+    (ssh / "id_ed25519.pub").write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA id\n")
+
+    observations = scanner.discover_public_keys(ssh)
+
+    by_name = {Path(o.path).name: o for o in observations}
+    assert by_name["huge.pub"].resolution is Resolution.UNREADABLE
+    assert by_name["huge.pub"].key_line is None
+    assert by_name["id_ed25519.pub"].resolution is Resolution.RESOLVED
+    assert by_name["id_ed25519.pub"].key_line == "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA id"
+    assert by_name["id_canary.pub"].resolution is Resolution.RESOLVED
     assert open_guard.violations == []

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 from ssh_id_doctor import fs
 from ssh_id_doctor.domain import Resolution
-from ssh_id_doctor.fs import EntryKind, PrivateKeyAccessDenied
+from ssh_id_doctor.fs import EntryKind, NotAPublicKeyFile, PrivateKeyAccessDenied
 
 PUBLIC_SUFFIX = ".pub"
 
@@ -64,7 +64,7 @@ def discover_public_keys(ssh_dir: str | os.PathLike[str]) -> list[PublicKeyObser
         except PrivateKeyAccessDenied:
             observations.append(PublicKeyObservation(path, Resolution.PRIVATE_ONLY))
             continue
-        except OSError:
+        except (OSError, NotAPublicKeyFile):
             observations.append(PublicKeyObservation(path, Resolution.UNREADABLE))
             continue
         observations.append(
