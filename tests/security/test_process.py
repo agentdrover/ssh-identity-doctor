@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -78,3 +80,26 @@ def test_run_passes_only_whitelisted_environment(monkeypatch: pytest.MonkeyPatch
     assert "SID_SECRET_PROBE" not in names
     assert "SSH_AUTH_SOCK" in names
     assert names <= set(process.ENV_WHITELIST)
+
+
+def test_run_reports_non_executable_file_and_directory_as_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SID-4 AC-4: a non-executable PATH entry is a result, not a raised PermissionError."""
+    non_exec = tmp_path / "fake-tool"
+    non_exec.write_text("#!/bin/sh\necho hi\n")
+    non_exec.chmod(0o644)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    file_result = process.run(["fake-tool"], timeout=1, max_output=1024)
+    assert file_result.status is ProcessStatus.NOT_EXECUTABLE
+    assert file_result.returncode is None
+
+    non_exec.unlink()
+    (tmp_path / "fake-tool").mkdir()
+
+    dir_result = process.run(["fake-tool"], timeout=1, max_output=1024)
+    assert dir_result.status is ProcessStatus.NOT_EXECUTABLE
+    assert dir_result.returncode is None
+
+    os.rmdir(tmp_path / "fake-tool")
