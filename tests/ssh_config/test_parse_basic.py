@@ -1,6 +1,7 @@
 """FR-004a (sdd-spec §7.4, §10 SEC-001/SEC-003): ssh_config(5) lexing and evaluation.
 
-Covers AC-1..AC-4.
+Covers AC-1..AC-4 of SID-5. Include, glob and cycle behavior (FR-004b) lives in
+``tests/ssh_config/test_include.py``.
 """
 
 from __future__ import annotations
@@ -16,7 +17,11 @@ import pytest
 
 from conftest import CANARY, CANARY_PRIVATE_KEY, OpenGuard
 from ssh_id_doctor import fs, ssh_config
-from ssh_id_doctor.ssh_config import IdentityFileEntry, ResolvedIdentityFile
+from ssh_id_doctor.ssh_config import IdentityFileEntry, ResolvedIdentityFile, SourceLoc
+
+
+def _real(path: str | os.PathLike[str]) -> str:
+    return os.path.realpath(os.fspath(path))
 
 
 @pytest.fixture
@@ -63,10 +68,12 @@ def test_first_value_wins_with_global_and_host_blocks(tmp_path: Path) -> None:
 
     assert document.unresolved == ()
     assert resolved.user == "global"
-    assert resolved.user_source_line == 1
+    assert resolved.user_source == SourceLoc(_real(config), 1)
     assert resolved.hostname == "github.com"
-    assert resolved.hostname_source_line == 4
-    assert resolved.identity_files == (ResolvedIdentityFile("~/.ssh/gh_ed25519", str(config), 6),)
+    assert resolved.hostname_source == SourceLoc(_real(config), 4)
+    assert resolved.identity_files == (
+        ResolvedIdentityFile("~/.ssh/gh_ed25519", SourceLoc(_real(config), 6)),
+    )
     assert resolved.patterns == ("gh", "github.com")
 
 
@@ -88,7 +95,7 @@ def test_identityfile_accumulates_scalars_first_wins(tmp_path: Path) -> None:
 
     assert [entry.path for entry in resolved.identity_files] == ["a", "b"]
     assert resolved.identities_only is True
-    assert resolved.identities_only_source_line == 3
+    assert resolved.identities_only_source == SourceLoc(_real(config), 3)
 
 
 def test_lexer_quotes_equals_case_and_bad_line(tmp_path: Path) -> None:
@@ -108,14 +115,16 @@ def test_lexer_quotes_equals_case_and_bad_line(tmp_path: Path) -> None:
 
     document = ssh_config.parse_file(config)
 
-    assert document.global_block.identity_files == (IdentityFileEntry("/path with space/key", 1),)
+    assert document.global_block.identity_files == (
+        IdentityFileEntry("/path with space/key", SourceLoc(_real(config), 1)),
+    )
     assert document.global_block.hostname == "Example.COM"
-    assert document.global_block.hostname_line == 2
+    assert document.global_block.hostname_source == SourceLoc(_real(config), 2)
     assert len(document.unresolved) == 1
     bad = document.unresolved[0]
     assert bad.reason == "malformed_line"
     assert bad.source_line == 7
-    assert bad.source_file == str(config)
+    assert bad.source_file == _real(config)
 
 
 def test_host_pattern_negation_excludes_block(tmp_path: Path) -> None:
@@ -223,7 +232,8 @@ def test_config_read_refuses_fifo_oversize_and_private_material(
 def test_match_opens_unresolved_stanza_not_merged_into_neighbours(
     tmp_path: Path, match_keyword: str
 ) -> None:
-    """Review #593: a ``Match`` line starts its own stanza (SID-6 evaluates it). Until then the
+    """Review #593: a ``Match`` line starts its own stanza (SID-6 evaluates it — see summary
+    for the ``match_not_evaluated``/``unsupported_match`` naming decision). Until then the
     stanza is an unresolved item with file:line, and none of its options leak into the
     preceding ``Host`` block, the global block, or any alias's ``evaluate()``; the next
     ``Host`` closes it as usual. Checked against ``ssh -G -F <file> <alias>``."""
@@ -247,22 +257,24 @@ def test_match_opens_unresolved_stanza_not_merged_into_neighbours(
 
     match_items = [item for item in document.unresolved if item.reason == "match_not_evaluated"]
     assert [(item.source_file, item.source_line) for item in match_items] == [
-        (str(config), 1),
-        (str(config), 6),
+        (_real(config), 1),
+        (_real(config), 6),
     ]
     assert document.global_block.user is None
     assert document.global_block.identity_files == ()
     assert [block.patterns for block in document.host_blocks] == [("special",), ("real",)]
 
     special = document.evaluate("special")
-    assert special.identity_files == (ResolvedIdentityFile("/special/key", str(config), 5),)
+    assert special.identity_files == (
+        ResolvedIdentityFile("/special/key", SourceLoc(_real(config), 5)),
+    )
     assert special.hostname is None
     assert special.identities_only is None
     assert special.user is None
 
     real = document.evaluate("real")
     assert real.user == "from_host"
-    assert real.user_source_line == 11
+    assert real.user_source == SourceLoc(_real(config), 11)
     assert real.identity_files == ()
 
     for alias in ("never", "other"):
@@ -271,3 +283,29 @@ def test_match_opens_unresolved_stanza_not_merged_into_neighbours(
         assert resolved.hostname is None
         assert resolved.identities_only is None
         assert resolved.identity_files == ()
+
+
+def test_value_with_unresolved_token_kept_literal_and_flagged(tmp_path: Path) -> None:
+    """scope_in: a value with %h/%r/%d/%u or ${VAR} is never expanded; it is kept as its
+    literal text and paired with an ``unresolved_token`` item naming the line."""
+    lines = [
+        "Host h",  # line 1
+        "IdentityFile ~/.ssh/%h_key",  # line 2
+        "User ${REMOTE_USER}",  # line 3
+    ]
+    config = tmp_path / "config"
+    config.write_text("\n".join(lines) + "\n")
+
+    document = ssh_config.parse_file(config)
+    resolved = document.evaluate("h")
+
+    assert resolved.identity_files == (
+        ResolvedIdentityFile("~/.ssh/%h_key", SourceLoc(_real(config), 2)),
+    )
+    assert resolved.user == "${REMOTE_USER}"
+    token_items = {(item.source_line, item.detail) for item in document.unresolved}
+    assert token_items == {
+        (2, "~/.ssh/%h_key"),
+        (3, "${REMOTE_USER}"),
+    }
+    assert all(item.reason == "unresolved_token" for item in document.unresolved)

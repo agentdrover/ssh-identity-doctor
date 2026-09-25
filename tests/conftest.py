@@ -9,7 +9,11 @@ Three layers, all built on the one HOME redirection below (SID-1):
   of any path inside the synthetic HOME that is not a ``.pub`` or config file
   raises and fails the test — even if the code under test swallows the error,
   because every attempt is recorded and checked at teardown. Paths outside the
-  synthetic HOME (pytest, uv, imports, tmp_path) pass straight through.
+  synthetic HOME (pytest, uv, imports, tmp_path) pass straight through. An
+  ``Include`` target can have any name (``config.d/work``, ``hosts/*.cfg``),
+  so a test exercising one calls ``open_guard.allow(*paths)`` with exactly the
+  paths its own fixture expects the parser to read — the general name/suffix
+  rule is not loosened to admit them.
 - ``fake_home``: populates HOME/.ssh with a public key, a config and the
   private-key trap ``id_canary`` whose bytes contain ``CANARY``.
 """
@@ -48,6 +52,16 @@ class PrivateReadAttempt(AssertionError):
 class OpenGuard:
     home: str
     violations: list[str] = field(default_factory=list)
+    allowed: set[str] = field(default_factory=set)
+
+    def allow(self, *paths: str | os.PathLike[str]) -> None:
+        """Permit a read of exactly these real paths, for one test.
+
+        For an Include target the parser is expected to read: list it here
+        explicitly instead of widening ``ALLOWED_SUFFIXES``/``ALLOWED_NAMES``.
+        """
+        for path in paths:
+            self.allowed.add(os.path.realpath(os.fsdecode(os.fspath(path))))
 
     def is_protected(self, file: object) -> bool:
         if isinstance(file, int) or not isinstance(file, str | bytes | os.PathLike):
@@ -56,6 +70,8 @@ class OpenGuard:
         real = os.path.realpath(raw)
         inside = real == self.home or real.startswith(self.home + os.sep)
         if not inside:
+            return False
+        if real in self.allowed:
             return False
         name = os.path.basename(real)
         return not (name.endswith(ALLOWED_SUFFIXES) or name in ALLOWED_NAMES)
