@@ -7,13 +7,15 @@ Nothing here changes permissions or timestamps.
 
 :func:`read_public_text` is the single reading function. It refuses, by name
 and before any ``open``, every path that is not a ``.pub`` file (including a
-``.pub`` symlink whose target is not one), and it refuses a ``.pub`` file whose
-first line is a private-key header — a private key renamed to look public.
+``.pub`` symlink whose target is not one), and it refuses a ``.pub`` file that
+holds a private-key header on any line — not just the first — since a private
+key can be renamed to look public with an unrelated line prepended.
 """
 
 from __future__ import annotations
 
 import os
+import stat
 from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import StrEnum
@@ -33,6 +35,13 @@ _PRIVATE_MARKERS: tuple[bytes, ...] = (
 
 class PrivateKeyAccessDenied(PermissionError):
     """Raised instead of reading something that is or may be a private key."""
+
+
+class NotAPublicKeyFile(ValueError):
+    """A ``.pub`` path that cannot hold a public key: not a regular file, or too large.
+
+    Callers record such a path as unresolved instead of aborting a scan.
+    """
 
 
 class EntryKind(StrEnum):
@@ -113,11 +122,16 @@ def safe_walk(root: str | os.PathLike[str]) -> Iterator[WalkEntry]:
         pending.extend(reversed(subdirs))
 
 
-def looks_like_private_key(first_line: bytes) -> bool:
-    line = first_line.strip()
-    if line.startswith(b"-----BEGIN") and b"PRIVATE KEY" in line:
+def looks_like_private_key(data: bytes) -> bool:
+    """True if any line of ``data`` carries a private-key header or marker."""
+    return any(_is_private_key_line(line) for line in data.split(b"\n"))
+
+
+def _is_private_key_line(line: bytes) -> bool:
+    stripped = line.strip()
+    if stripped.startswith(b"-----BEGIN") and b"PRIVATE KEY" in stripped:
         return True
-    return any(line.startswith(marker) for marker in _PRIVATE_MARKERS)
+    return any(stripped.startswith(marker) for marker in _PRIVATE_MARKERS)
 
 
 def read_public_text(path: str | os.PathLike[str], *, max_bytes: int = MAX_PUBLIC_BYTES) -> str:
@@ -125,17 +139,27 @@ def read_public_text(path: str | os.PathLike[str], *, max_bytes: int = MAX_PUBLI
 
     Refuses with :class:`PrivateKeyAccessDenied` — before opening — any path
     whose name, or whose symlink target's name, lacks the ``.pub`` suffix; and,
-    after reading the first line, a ``.pub`` file holding a private-key header.
-    The message names the file only by its base name.
+    after reading the content, a ``.pub`` file holding a private-key header on
+    any line (not just the first). A target that is not a regular file (FIFO,
+    socket, device) is refused with :class:`NotAPublicKeyFile` before any
+    ``open``, as is content over ``max_bytes``. The message names the file only by its base
+    name and never quotes file content.
     """
     normalized = _normalize(path)
     real = Path(os.path.realpath(normalized))
     if normalized.suffix != PUBLIC_SUFFIX or real.suffix != PUBLIC_SUFFIX:
         raise PrivateKeyAccessDenied(f"refusing to read non-.pub file {normalized.name!r}")
-    with open(real, "rb") as handle:
+    if not stat.S_ISREG(os.stat(real).st_mode):
+        raise NotAPublicKeyFile(f"{normalized.name!r} is not a regular file")
+    # O_NONBLOCK: should the path be swapped for a FIFO after the check above,
+    # the open still returns at once and the fstat below refuses it.
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+    with os.fdopen(os.open(real, flags), "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise NotAPublicKeyFile(f"{normalized.name!r} is not a regular file")
         data = handle.read(max_bytes + 1)
-    if looks_like_private_key(data.split(b"\n", 1)[0]):
+    if looks_like_private_key(data):
         raise PrivateKeyAccessDenied(f"{normalized.name!r} holds private-key material")
     if len(data) > max_bytes:
-        raise ValueError(f"{normalized.name!r} exceeds {max_bytes} bytes; not a public key")
+        raise NotAPublicKeyFile(f"{normalized.name!r} exceeds {max_bytes} bytes; not a public key")
     return data.decode("utf-8", errors="replace")
