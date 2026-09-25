@@ -14,6 +14,9 @@ Guarantees, by construction rather than by caller discipline:
   drained and discarded so a chatty child can neither block nor exhaust memory.
 - The child environment is reduced to a whitelist (``ENV_WHITELIST``).
 - A missing executable is a result (``not_found``), not an exception.
+- An executable that exists but cannot be run (no +x bit, or the name on
+  ``PATH`` is a directory) is a result (``not_executable``), not a raised
+  ``PermissionError`` (sdd-spec §12, SID-2 review finding).
 """
 
 from __future__ import annotations
@@ -39,6 +42,7 @@ class ProcessStatus(StrEnum):
     NONZERO = "nonzero"
     TIMEOUT = "timeout"
     NOT_FOUND = "not_found"
+    NOT_EXECUTABLE = "not_executable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +124,11 @@ def run(argv: Sequence[str], *, timeout: float, max_output: int) -> ProcessResul
         )
     except FileNotFoundError:
         return ProcessResult(ProcessStatus.NOT_FOUND, None, b"", b"", False)
+    except PermissionError:
+        # argv[0] resolved to something on PATH that exec() refuses: a file
+        # without the execute bit, or a directory sharing the executable's
+        # name. Both surface as EACCES/PermissionError, never a traceback.
+        return ProcessResult(ProcessStatus.NOT_EXECUTABLE, None, b"", b"", False)
     assert proc.stdout is not None and proc.stderr is not None  # noqa: S101 - PIPE requested
     readers = (_BoundedReader(proc.stdout, max_output), _BoundedReader(proc.stderr, max_output))
     for reader in readers:
