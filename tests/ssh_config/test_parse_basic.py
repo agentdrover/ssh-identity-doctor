@@ -217,3 +217,57 @@ def test_config_read_refuses_fifo_oversize_and_private_material(
     out, err = capsys.readouterr()
     assert CANARY not in out + err
     assert open_guard.violations == []
+
+
+@pytest.mark.parametrize("match_keyword", ["Match", "match", "MATCH"])
+def test_match_opens_unresolved_stanza_not_merged_into_neighbours(
+    tmp_path: Path, match_keyword: str
+) -> None:
+    """Review #593: a ``Match`` line starts its own stanza (SID-6 evaluates it). Until then the
+    stanza is an unresolved item with file:line, and none of its options leak into the
+    preceding ``Host`` block, the global block, or any alias's ``evaluate()``; the next
+    ``Host`` closes it as usual. Checked against ``ssh -G -F <file> <alias>``."""
+    lines = [
+        f"{match_keyword} host never",  # line 1: Match before the first Host
+        "User from_match",  # line 2
+        "IdentityFile /from/match",  # line 3
+        "Host special",  # line 4
+        "IdentityFile /special/key",  # line 5
+        f"{match_keyword} host other",  # line 6: Match after a Host
+        "IdentityFile /leaked/key",  # line 7
+        "HostName leaked.example",  # line 8
+        "IdentitiesOnly yes",  # line 9
+        "Host real",  # line 10
+        "User from_host",  # line 11
+    ]
+    config = tmp_path / "config"
+    config.write_text("\n".join(lines) + "\n")
+
+    document = ssh_config.parse_file(config)
+
+    match_items = [item for item in document.unresolved if item.reason == "match_not_evaluated"]
+    assert [(item.source_file, item.source_line) for item in match_items] == [
+        (str(config), 1),
+        (str(config), 6),
+    ]
+    assert document.global_block.user is None
+    assert document.global_block.identity_files == ()
+    assert [block.patterns for block in document.host_blocks] == [("special",), ("real",)]
+
+    special = document.evaluate("special")
+    assert special.identity_files == (ResolvedIdentityFile("/special/key", str(config), 5),)
+    assert special.hostname is None
+    assert special.identities_only is None
+    assert special.user is None
+
+    real = document.evaluate("real")
+    assert real.user == "from_host"
+    assert real.user_source_line == 11
+    assert real.identity_files == ()
+
+    for alias in ("never", "other"):
+        resolved = document.evaluate(alias)
+        assert resolved.user is None
+        assert resolved.hostname is None
+        assert resolved.identities_only is None
+        assert resolved.identity_files == ()

@@ -16,7 +16,9 @@ Unsupported options are ignored without breaking the parse; a line with no
 keyword before its separator becomes an :class:`UnresolvedConfigItem` naming
 its line, and parsing continues with the rest of the file. ``Include``,
 ``Match`` and the ``%h``/``%d``/``${VAR}`` tokens are out of scope (SID-6);
-a ``Match`` line is currently just an unsupported keyword.
+a ``Match`` line starts its own stanza, reported as an
+:class:`UnresolvedConfigItem` (``match_not_evaluated``) with its line, whose
+options are applied to no alias until the next ``Host``.
 
 The file itself is read only through :func:`ssh_id_doctor.fs.read_config_text`
 (SEC-001/SEC-003): a target that is not a regular file, is over the size
@@ -197,6 +199,14 @@ def parse_file(path: str | os.PathLike[str]) -> ConfigDocument:
         if key == "host":
             current = _MutableBlock(patterns=tuple(tokens), header_line=lineno)
             blocks.append(current)
+            continue
+        if key == "match":
+            # SID-6 evaluates Match; until then its stanza is unresolved and its
+            # options go into a detached block that no alias ever sees.
+            unresolved.append(
+                UnresolvedConfigItem("match_not_evaluated", raw_line.strip(), path_str, lineno)
+            )
+            current = _MutableBlock(patterns=(), header_line=lineno)
             continue
         if key not in _SUPPORTED_KEYS:
             continue
