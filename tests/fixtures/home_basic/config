@@ -1,0 +1,23 @@
+Host gh github.com
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/id_ed25519
+
+Host server
+    HostName server.example.com
+    User admin
+    IdentityFile ~/.ssh/id_rsa
+
+Host canary-test
+    IdentityFile ~/.ssh/id_canary
+
+Host missing-key
+    IdentityFile ~/.ssh/nonexistent_key
+
+Host wildcard-test *.example.com
+    User wildcard
+
+Match host specific.example.com
+    IdentityFile ~/.ssh/id_ed25519
+
+Include config.d/*.conf
