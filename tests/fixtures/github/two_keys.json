@@ -1,0 +1,14 @@
+[
+  {
+    "id": 1001,
+    "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICy6m9y8JQXK/rnkedDzK3YZbu5pH10XpE6+eVYTfnB1 work@example",
+    "title": "old-laptop",
+    "created_at": "2023-01-10T12:00:00Z"
+  },
+  {
+    "id": 1002,
+    "key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBB4CGy8WG4R9VzLxrESabuxBG12PpjeInRGQnhMTAS9ib/JkgmWdsasDxhS3nwCXjhPIVGhNOk6b5ImwbUE7E3Y= work-ecdsa@example",
+    "title": "ci",
+    "created_at": "2023-06-15T09:30:00Z"
+  }
+]
