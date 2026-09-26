@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from conftest import CANARY_PRIVATE_KEY, OpenGuard
+from ssh_id_doctor.adapters.github import RegistryResult, RegistryState
 from ssh_id_doctor.domain import (
     Confidence,
     CoverageState,
@@ -14,7 +15,6 @@ from ssh_id_doctor.domain import (
     Finding,
     ScanSnapshot,
     Severity,
-    SourceCoverage,
 )
 from ssh_id_doctor.inspectors.agent import AgentResult, AgentState
 from ssh_id_doctor.orchestrator import OrchestratorOptions, ScanOrchestrator
@@ -36,11 +36,9 @@ class FakeTimeoutAgent:
 class FakeNotAuthenticatedGitHub:
     """GitHub registry adapter returning UNAVAILABLE (not authenticated)."""
 
-    def list_keys(self) -> SourceCoverage:
-        return SourceCoverage(
-            source="github",
-            state=CoverageState.UNAVAILABLE,
-            required=False,
+    def list_keys(self) -> RegistryResult:
+        return RegistryResult(
+            state=RegistryState.NOT_AUTHENTICATED,
             detail="gh: not authenticated",
         )
 
@@ -62,7 +60,10 @@ def home_basic_setup(fake_home: Path) -> Path:
     )
     (config_d / "cycle.conf").write_text((FIXTURES_HOME / "config.d" / "cycle.conf").read_text())
 
-    # Ensure canary private key exists and chmod 0600
+    # §13.3: the canary is a private-only reference. fake_home also plants
+    # id_canary.pub; drop it so Host canary-test names no fingerprint. The
+    # private trap id_canary stays (0600) and the open guard stays armed.
+    (ssh / "id_canary.pub").unlink()
     (ssh / "id_canary").write_text(CANARY_PRIVATE_KEY)
     (ssh / "id_canary").chmod(0o600)
 
@@ -80,7 +81,7 @@ def test_optional_source_failures_keep_local_results(
     """
     orchestrator = ScanOrchestrator(
         agent_adapter=FakeTimeoutAgent(),  # type: ignore[arg-type]
-        github_adapter=FakeNotAuthenticatedGitHub(),  # type: ignore[arg-type]
+        github_adapter=FakeNotAuthenticatedGitHub(),
     )
 
     opts = OrchestratorOptions(
@@ -120,6 +121,7 @@ def test_optional_source_failures_keep_local_results(
 
     assert "github" in source_map
     assert source_map["github"].state is CoverageState.UNAVAILABLE
+    assert source_map["github"].detail == "gh: not authenticated"
 
     # Guard check: canary was not read
     assert open_guard.violations == [], "SEC-001: canary private key was not opened"
@@ -189,3 +191,43 @@ def test_snapshot_and_finding_ids_are_deterministic(
         int(hex_part, 16)  # must be valid hex
 
     assert open_guard.violations == []
+
+
+def test_home_basic_has_two_identities_and_private_only_canary(
+    home_basic_setup: Path, open_guard: OpenGuard
+) -> None:
+    """Finding aca0075f07b943fb: home_basic (§13.3) has exactly two identities.
+
+    fake_home plants ~/.ssh/id_canary.pub; home_basic must not keep it, so the
+    canary is a private-only reference: Host canary-test resolves to no fingerprint.
+    The private-key trap stays planted and is never opened.
+    """
+    ssh = home_basic_setup / ".ssh"
+    assert (ssh / "id_canary").is_file()
+    assert not (ssh / "id_canary.pub").exists()
+
+    snapshot = ScanOrchestrator().run(
+        OrchestratorOptions(home=home_basic_setup, check_agent=False, check_github=False)
+    )
+
+    assert len(snapshot.identities) == 2
+    canary = [hb for hb in snapshot.host_bindings if "canary-test" in hb.patterns]
+    assert len(canary) == 1
+    assert canary[0].resolved_fingerprints == ()
+    assert open_guard.violations == []
+
+
+def test_github_disabled_is_recorded_as_skipped(home_basic_setup: Path) -> None:
+    """Finding b56d2bbc9f1d05b4: with check_github=False the github source is SKIPPED,
+
+    like a disabled agent, so every source has a SourceCoverage.
+    """
+    snapshot = ScanOrchestrator().run(
+        OrchestratorOptions(home=home_basic_setup, check_agent=False, check_github=False)
+    )
+
+    source_map = {s.source: s for s in snapshot.sources}
+    assert source_map["agent"].state is CoverageState.SKIPPED
+    assert "github" in source_map
+    assert source_map["github"].state is CoverageState.SKIPPED
+    assert source_map["github"].required is False

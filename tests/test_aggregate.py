@@ -132,3 +132,96 @@ def test_same_fingerprint_merged_with_all_relationships() -> None:
     gh_hb = gh_bindings[0]
     assert gh_hb.resolved_fingerprints == (fingerprint,)
     assert gh_hb.confidence is Confidence.CERTAIN
+
+
+def _host(pattern: str, identity_file: str, line: int) -> HostBlock:
+    return HostBlock(
+        patterns=(pattern,),
+        header=SourceLoc(file="/h/.ssh/config", line=line),
+        identity_files=(
+            IdentityFileEntry(
+                path=identity_file, source=SourceLoc(file="/h/.ssh/config", line=line + 1)
+            ),
+        ),
+    )
+
+
+def _doc(*blocks: HostBlock) -> ConfigDocument:
+    return ConfigDocument(
+        path="/h/.ssh/config",
+        global_block=HostBlock(patterns=(), header=None),
+        host_blocks=blocks,
+        unresolved=(),
+    )
+
+
+def _cfg_ref(path: str, line: int, resolution: Resolution) -> LocalReference:
+    return LocalReference(
+        kind=LocalReferenceKind.CONFIG_IDENTITY,
+        path=path,
+        source_file="/h/.ssh/config",
+        source_line=line,
+        resolution=resolution,
+    )
+
+
+RSA_FP = "SHA256:Kskz06nJKSQVXxudvVa4i2SSMi4R2H2KjSMgpNUyyFE"
+RSA_INFO = KeyInfo(fingerprint=RSA_FP, algorithm="ssh-rsa", bits_or_curve="3072", comment="rsa")
+
+
+def test_host_binding_without_resolved_fingerprint_is_unresolved() -> None:
+    """Finding 565eb2c83a220c3b: a Host whose IdentityFile resolves to no fingerprint
+
+    (missing key, private-only key) is UNRESOLVED; a Host whose key resolves stays CERTAIN.
+    """
+    obs = ScanObservations(
+        config_references=[
+            (_cfg_ref("/h/.ssh/id_rsa", 2, Resolution.RESOLVED), RSA_INFO),
+            (_cfg_ref("/h/.ssh/gone", 5, Resolution.MISSING), None),
+            (_cfg_ref("/h/.ssh/secret", 8, Resolution.PRIVATE_ONLY), None),
+        ],
+        config_document=_doc(
+            _host("server", "~/.ssh/id_rsa", 1),
+            _host("missing-key", "~/.ssh/gone", 4),
+            _host("private-only", "~/.ssh/secret", 7),
+        ),
+        home="/h",
+    )
+
+    snapshot = build_snapshot(obs)
+
+    by_host = {hb.patterns[0]: hb for hb in snapshot.host_bindings}
+    assert by_host["server"].confidence is Confidence.CERTAIN
+    assert by_host["missing-key"].confidence is Confidence.UNRESOLVED
+    assert by_host["private-only"].confidence is Confidence.UNRESOLVED
+
+
+def test_identity_file_matched_by_normalized_path_not_suffix() -> None:
+    """Finding f83d8a58db0b040c: IdentityFile 'rsa' is ~/.ssh/rsa, not a suffix of id_rsa.
+
+    Holds both through the config reference (matched by its source line) and without
+    one (path expanded like references.py: relative to ~/.ssh, ~ to HOME).
+    """
+    pub = PublicKeyObservation(path="/h/.ssh/id_rsa.pub", resolution=Resolution.RESOLVED)
+    obs = ScanObservations(
+        public_keys=[(pub, RSA_INFO)],
+        config_references=[
+            (_cfg_ref("/h/.ssh/id_rsa", 2, Resolution.RESOLVED), RSA_INFO),
+            (_cfg_ref("/h/.ssh/rsa", 5, Resolution.MISSING), None),
+        ],
+        config_document=_doc(
+            _host("full", "~/.ssh/id_rsa", 1),
+            _host("short", "rsa", 4),
+            _host("short-no-ref", "sa", 7),
+            _host("full-no-ref", "id_rsa", 10),
+        ),
+        home="/h",
+    )
+
+    snapshot = build_snapshot(obs)
+
+    by_host = {hb.patterns[0]: hb for hb in snapshot.host_bindings}
+    assert by_host["full"].resolved_fingerprints == (RSA_FP,)
+    assert by_host["short"].resolved_fingerprints == ()
+    assert by_host["short-no-ref"].resolved_fingerprints == ()
+    assert by_host["full-no-ref"].resolved_fingerprints == (RSA_FP,)

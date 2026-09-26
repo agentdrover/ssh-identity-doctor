@@ -21,9 +21,11 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from ssh_id_doctor import references, scanner, ssh_config
+from ssh_id_doctor.adapters.github import RegistryResult
 from ssh_id_doctor.aggregate import ScanObservations, build_snapshot
 from ssh_id_doctor.domain import (
     CoverageState,
+    RegistryBinding,
     ScanSnapshot,
     SourceCoverage,
 )
@@ -55,7 +57,7 @@ class SSHAgentAdapterProtocol(Protocol):
 
 
 class GitHubRegistryAdapterProtocol(Protocol):
-    def list_keys(self) -> Any: ...
+    def list_keys(self) -> RegistryResult: ...
 
 
 @dataclass
@@ -228,19 +230,12 @@ class ScanOrchestrator:
             )
 
         # 5. GitHubRegistryAdapter (optional)
-        registry_bindings: list[Any] = []
+        registry_bindings: list[RegistryBinding] = []
         if opts.check_github and self._github is not None:
             try:
                 gh_res = self._github.list_keys()
-                # Handle possible result types from GitHub adapter
-                if hasattr(gh_res, "bindings"):
-                    registry_bindings.extend(gh_res.bindings)
-                if hasattr(gh_res, "coverage"):
-                    sources.append(gh_res.coverage)
-                elif hasattr(gh_res, "as_coverage"):
-                    sources.append(gh_res.as_coverage())
-                elif isinstance(gh_res, SourceCoverage):
-                    sources.append(gh_res)
+                registry_bindings.extend(gh_res.bindings)
+                sources.append(gh_res.as_coverage())
             except RequiredSourceError:
                 raise
             except Exception as exc:
@@ -262,6 +257,15 @@ class ScanOrchestrator:
                     detail="github adapter not configured",
                 )
             )
+        else:
+            sources.append(
+                SourceCoverage(
+                    source="github",
+                    state=CoverageState.SKIPPED,
+                    required=False,
+                    detail="github check skipped",
+                )
+            )
 
         # 6. IdentityAggregator
         obs = ScanObservations(
@@ -273,6 +277,8 @@ class ScanOrchestrator:
             sources=sources,
             scan_id=scan_id,
             started_at=started_at,
+            home=str(home),
+            ssh_dir=str(ssh_dir),
         )
         intermediate_snapshot = build_snapshot(obs)
 

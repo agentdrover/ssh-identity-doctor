@@ -12,6 +12,7 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from ssh_id_doctor.domain import (
@@ -26,9 +27,12 @@ from ssh_id_doctor.domain import (
     ScanSnapshot,
     SourceCoverage,
 )
-from ssh_id_doctor.references import ConfigIdentityReference
+from ssh_id_doctor.references import (
+    ConfigIdentityReference,
+    _expand,  # the FR-002 normalization, not a copy
+)
 from ssh_id_doctor.scanner import PublicKeyObservation
-from ssh_id_doctor.ssh_config import ConfigDocument
+from ssh_id_doctor.ssh_config import ConfigDocument, IdentityFileEntry
 
 
 @dataclass
@@ -46,6 +50,8 @@ class ScanObservations:
     completed_at: str | None = None
     platform: Platform | None = None
     findings: Sequence[Finding] = ()
+    home: str | None = None
+    ssh_dir: str | None = None
 
 
 @dataclass
@@ -57,6 +63,43 @@ class _MutableIdentity:
     local_references: list[LocalReference] = field(default_factory=list)
     agent_presence: bool = False
     registry_bindings: list[RegistryBinding] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _EntryResolver:
+    """Find the fingerprint an IdentityFile entry names, by exact normalized path.
+
+    First by the config reference declared on the same source line (its path is
+    already normalized by references.py); without one, the raw value is expanded
+    the way references.py does (``~`` to HOME, relative to ``~/.ssh``) and looked
+    up as the key path or its ``.pub``. Never by suffix: ``rsa`` is not ``id_rsa``.
+    """
+
+    by_source: dict[tuple[str | None, int | None], str | None]
+    path_to_fingerprint: dict[str, str]
+    home: str | None
+    ssh_dir: str | None
+
+    def fingerprint(self, entry: IdentityFileEntry) -> str | None:
+        key = (entry.source.file, entry.source.line)
+        if key in self.by_source:
+            return self.by_source[key]
+        raw = entry.path.strip()
+        if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
+            raw = raw[1:-1]
+        if self.home is None and not os.path.isabs(raw):
+            return None
+        home_path = Path(os.path.realpath(self.home)) if self.home else None
+        ssh_dir_path = Path(os.path.realpath(self.ssh_dir)) if self.ssh_dir else None
+        normalized = str(_expand(raw, home_path, ssh_dir_path))
+        candidates = [normalized]
+        if not normalized.endswith(".pub"):
+            candidates.append(normalized + ".pub")
+        for candidate in candidates:
+            for path in (candidate, os.path.realpath(candidate)):
+                if path in self.path_to_fingerprint:
+                    return self.path_to_fingerprint[path]
+        return None
 
 
 def _detect_platform() -> Platform:
@@ -117,6 +160,9 @@ def build_snapshot(observations: ScanObservations) -> ScanSnapshot:
             path_to_fingerprint[canonical_path] = fp
             path_to_fingerprint[pub_obs.path] = fp
 
+    # Fingerprint (or None) of each config IdentityFile, keyed by where it was declared
+    fingerprint_by_source: dict[tuple[str | None, int | None], str | None] = {}
+
     # 2. Process config identity references
     for cfg_ref, key_info in observations.config_references:
         # Strip public_key_text / key_line if present, convert to domain.LocalReference
@@ -139,14 +185,15 @@ def build_snapshot(observations: ScanObservations) -> ScanSnapshot:
                 mid.comments.add(comment)
             path_to_fingerprint[canonical_path] = fp
             path_to_fingerprint[cfg_ref.path] = fp
+            fingerprint_by_source[(cfg_ref.source_file, cfg_ref.source_line)] = fp
         else:
             # If cfg_ref was not keyed with key_info, check if we already resolved this path
-            if canonical_path in path_to_fingerprint:
-                fp = path_to_fingerprint[canonical_path]
-                identities_by_fp[fp].local_references.append(domain_loc_ref)
-            elif cfg_ref.path in path_to_fingerprint:
-                fp = path_to_fingerprint[cfg_ref.path]
-                identities_by_fp[fp].local_references.append(domain_loc_ref)
+            known_fp = path_to_fingerprint.get(canonical_path) or path_to_fingerprint.get(
+                cfg_ref.path
+            )
+            if known_fp is not None:
+                identities_by_fp[known_fp].local_references.append(domain_loc_ref)
+            fingerprint_by_source[(cfg_ref.source_file, cfg_ref.source_line)] = known_fp
 
     # 3. Process agent identities
     for agent_id in observations.agent_identities:
@@ -216,47 +263,30 @@ def build_snapshot(observations: ScanObservations) -> ScanSnapshot:
     final_host_bindings: list[HostBinding] = []
     if observations.config_document is not None:
         doc = observations.config_document
+        resolver = _EntryResolver(
+            by_source=fingerprint_by_source,
+            path_to_fingerprint=path_to_fingerprint,
+            home=observations.home or os.environ.get("HOME"),
+            ssh_dir=observations.ssh_dir,
+        )
         for block in doc.host_blocks:
             if not block.patterns:
                 continue  # Skip blocks without patterns (like Match or global)
             id_refs = tuple(entry.path for entry in block.identity_files)
             resolved_fps: list[str] = []
+            unresolved_entries = 0
             for entry in block.identity_files:
-                entry_path = entry.path.strip()
-                if entry_path.startswith('"') and entry_path.endswith('"') and len(entry_path) >= 2:
-                    entry_path = entry_path[1:-1]
-
-                # Check directly or via canonical paths
-                found_fp = path_to_fingerprint.get(entry_path)
+                found_fp = resolver.fingerprint(entry)
                 if found_fp is None:
-                    # Also check tilde-expanded or resolved paths
-                    if entry_path.startswith("~/"):
-                        home_dir = os.environ.get("HOME")
-                        if home_dir:
-                            expanded = os.path.normpath(os.path.join(home_dir, entry_path[2:]))
-                            found_fp = path_to_fingerprint.get(expanded) or path_to_fingerprint.get(
-                                os.path.realpath(expanded)
-                            )
-                if found_fp is None:
-                    # Try resolving against doc dir or home
-                    doc_dir = os.path.dirname(doc.path)
-                    candidate = os.path.normpath(os.path.join(doc_dir, entry_path))
-                    found_fp = path_to_fingerprint.get(candidate)
-                    if found_fp is None:
-                        real_candidate = os.path.realpath(candidate)
-                        found_fp = path_to_fingerprint.get(real_candidate)
-                # Also check matching against any registered reference path
-                if found_fp is None:
-                    for ref_path, ref_fp in path_to_fingerprint.items():
-                        if ref_path.endswith(entry_path.lstrip("~").lstrip("/")):
-                            found_fp = ref_fp
-                            break
-                if found_fp and found_fp not in resolved_fps:
+                    unresolved_entries += 1
+                elif found_fp not in resolved_fps:
                     resolved_fps.append(found_fp)
 
             header_file = block.header.file if block.header else doc.path
             header_line = block.header.line if block.header else 1
-            confidence = Confidence.CERTAIN if block.patterns else Confidence.UNRESOLVED
+            # A reference that names no fingerprint (missing, private-only, token)
+            # leaves the host's identity unknown.
+            confidence = Confidence.UNRESOLVED if unresolved_entries else Confidence.CERTAIN
 
             final_host_bindings.append(
                 HostBinding(
