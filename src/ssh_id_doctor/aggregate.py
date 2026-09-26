@@ -102,6 +102,18 @@ class _EntryResolver:
         return None
 
 
+def _sorted_unbound(refs: Sequence[LocalReference]) -> tuple[LocalReference, ...]:
+    unique = {
+        (r.kind.value, r.path, r.source_file, r.source_line, r.resolution.value): r for r in refs
+    }
+    return tuple(
+        sorted(
+            unique.values(),
+            key=lambda r: (r.source_file or "", r.source_line or 0, r.path, r.kind.value),
+        )
+    )
+
+
 def _detect_platform() -> Platform:
     if sys.platform == "darwin":
         return Platform.MACOS
@@ -135,6 +147,9 @@ def build_snapshot(observations: ScanObservations) -> ScanSnapshot:
                 mid.bits_or_curve = bits
         return identities_by_fp[fp]
 
+    # References that name no fingerprint and so belong to no Identity
+    unbound_references: list[LocalReference] = []
+
     # Map from canonical path -> fingerprint for resolved local references
     path_to_fingerprint: dict[str, str] = {}
 
@@ -159,6 +174,8 @@ def build_snapshot(observations: ScanObservations) -> ScanSnapshot:
             canonical_path = os.path.realpath(os.path.normpath(pub_obs.path))
             path_to_fingerprint[canonical_path] = fp
             path_to_fingerprint[pub_obs.path] = fp
+        else:
+            unbound_references.append(loc_ref)
 
     # Fingerprint (or None) of each config IdentityFile, keyed by where it was declared
     fingerprint_by_source: dict[tuple[str | None, int | None], str | None] = {}
@@ -193,6 +210,8 @@ def build_snapshot(observations: ScanObservations) -> ScanSnapshot:
             )
             if known_fp is not None:
                 identities_by_fp[known_fp].local_references.append(domain_loc_ref)
+            else:
+                unbound_references.append(domain_loc_ref)
             fingerprint_by_source[(cfg_ref.source_file, cfg_ref.source_line)] = known_fp
 
     # 3. Process agent identities
@@ -327,6 +346,7 @@ def build_snapshot(observations: ScanObservations) -> ScanSnapshot:
         identities=tuple(final_identities),
         host_bindings=tuple(final_host_bindings),
         findings=sorted_findings,
+        local_references=_sorted_unbound(unbound_references),
     )
 
 

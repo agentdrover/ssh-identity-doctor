@@ -13,6 +13,8 @@ from ssh_id_doctor.domain import (
     CoverageState,
     EvidenceReference,
     Finding,
+    LocalReferenceKind,
+    Resolution,
     ScanSnapshot,
     Severity,
 )
@@ -231,3 +233,35 @@ def test_github_disabled_is_recorded_as_skipped(home_basic_setup: Path) -> None:
     assert "github" in source_map
     assert source_map["github"].state is CoverageState.SKIPPED
     assert source_map["github"].required is False
+
+
+def test_unbound_config_references_are_in_snapshot_and_distinguishable(
+    home_basic_setup: Path, open_guard: OpenGuard
+) -> None:
+    """Finding 343c16827cf015fe: an IdentityFile with no fingerprint is not dropped.
+
+    It lands in snapshot.local_references with its resolution and provenance, so
+    missing-key (missing) and canary-test (private_only) do not look alike.
+    """
+    snapshot = ScanOrchestrator().run(
+        OrchestratorOptions(home=home_basic_setup, check_agent=False, check_github=False)
+    )
+
+    ssh = home_basic_setup / ".ssh"
+    config = str(ssh / "config")
+    by_path = {Path(ref.path).name: ref for ref in snapshot.local_references}
+    missing = by_path["nonexistent_key"]
+    canary = by_path["id_canary"]
+    assert missing.kind is LocalReferenceKind.CONFIG_IDENTITY
+    assert missing.resolution is Resolution.MISSING
+    assert (missing.source_file, missing.source_line) == (config, 15)
+    assert canary.kind is LocalReferenceKind.CONFIG_IDENTITY
+    assert canary.resolution is Resolution.PRIVATE_ONLY
+    assert (canary.source_file, canary.source_line) == (config, 12)
+    bound = {ref.path for ident in snapshot.identities for ref in ident.local_references}
+    assert not bound & {missing.path, canary.path}
+    assert list(snapshot.local_references) == sorted(
+        snapshot.local_references,
+        key=lambda r: (r.source_file or "", r.source_line or 0, r.path),
+    )
+    assert open_guard.violations == []

@@ -13,7 +13,9 @@ from ssh_id_doctor.domain import (
     Identity,
     LocalReference,
     LocalReferenceKind,
+    Platform,
     Resolution,
+    ScanSnapshot,
     Severity,
 )
 
@@ -80,3 +82,20 @@ def test_domain_module_imports_no_io() -> None:
             imported.add(node.module.split(".")[0])
     assert imported.isdisjoint({"subprocess", "os", "pathlib", "io", "socket", "shutil"})
     assert "open(" not in inspect.getsource(domain)
+
+
+def test_scan_snapshot_local_references_is_additive() -> None:
+    """#1385: ScanSnapshot.local_references (unbound references) defaults to empty,
+
+    so a snapshot built without it is unchanged and schema_version stays 1.0.
+    """
+    snapshot = ScanSnapshot(
+        scan_id="00000000-0000-0000-0000-000000000000",
+        started_at="2026-01-01T00:00:00+00:00",
+        completed_at="2026-01-01T00:00:00+00:00",
+        platform=Platform.LINUX,
+    )
+    assert snapshot.local_references == ()
+    assert snapshot.schema_version == "1.0"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        snapshot.local_references = ()  # type: ignore[misc]
