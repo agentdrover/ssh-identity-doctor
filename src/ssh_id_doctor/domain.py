@@ -153,3 +153,7 @@ class ScanSnapshot:
     host_bindings: tuple[HostBinding, ...] = ()
     findings: tuple[Finding, ...] = ()
     schema_version: str = SCHEMA_VERSION
+    local_references: tuple[LocalReference, ...] = ()
+    """References bound to no Identity (no fingerprint: missing, private_only,
+    unreadable, outside_root), sorted by (source_file, source_line, path).
+    Additive to schema 1.0; bound references live in Identity.local_references."""
