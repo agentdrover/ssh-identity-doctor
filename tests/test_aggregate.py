@@ -14,7 +14,13 @@ from ssh_id_doctor.domain import (
 from ssh_id_doctor.inspectors.keygen import KeyInfo
 from ssh_id_doctor.references import LocalReference
 from ssh_id_doctor.scanner import PublicKeyObservation
-from ssh_id_doctor.ssh_config import ConfigDocument, HostBlock, IdentityFileEntry, SourceLoc
+from ssh_id_doctor.ssh_config import (
+    ConfigDocument,
+    HostBlock,
+    IdentityFileEntry,
+    SourceLoc,
+    UnresolvedConfigItem,
+)
 
 
 def test_same_fingerprint_merged_with_all_relationships() -> None:
@@ -225,3 +231,31 @@ def test_identity_file_matched_by_normalized_path_not_suffix() -> None:
     assert by_host["short"].resolved_fingerprints == ()
     assert by_host["short-no-ref"].resolved_fingerprints == ()
     assert by_host["full-no-ref"].resolved_fingerprints == (RSA_FP,)
+
+
+def test_aggregate_unresolved_items_mapped_and_sorted() -> None:
+    doc = ConfigDocument(
+        path="/h/.ssh/config",
+        global_block=HostBlock(patterns=(), header=None),
+        host_blocks=(),
+        unresolved=(
+            UnresolvedConfigItem(
+                "match_not_evaluated", "Match host specific", "/h/.ssh/config", 20
+            ),
+            UnresolvedConfigItem("include_cycle", "/h/.ssh/loop.conf", "/h/.ssh/config", 5),
+            UnresolvedConfigItem("malformed_line", "bad line", "/h/.ssh/config", 2),
+            UnresolvedConfigItem("unresolved_token", "%h", "/h/.ssh/config", 10),
+        ),
+    )
+    obs = ScanObservations(
+        config_document=doc,
+    )
+    snapshot = build_snapshot(obs)
+    assert len(snapshot.unresolved) == 4
+    kinds_and_lines = [(u.kind, u.source_line) for u in snapshot.unresolved]
+    assert kinds_and_lines == [
+        ("malformed_line", 2),
+        ("include_cycle", 5),
+        ("unresolved_token", 10),
+        ("unsupported_match", 20),
+    ]

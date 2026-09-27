@@ -57,10 +57,14 @@ def home_basic_setup(fake_home: Path) -> Path:
 
     config_d = ssh / "config.d"
     config_d.mkdir(exist_ok=True)
-    (config_d / "included.conf").write_text(
-        (FIXTURES_HOME / "config.d" / "included.conf").read_text()
-    )
-    (config_d / "cycle.conf").write_text((FIXTURES_HOME / "config.d" / "cycle.conf").read_text())
+    inc_text = (FIXTURES_HOME / "config.d" / "included.conf").read_text()
+    cyc_text = (FIXTURES_HOME / "config.d" / "cycle.conf").read_text()
+    if "Include cycle.conf" in inc_text:
+        inc_text = inc_text.replace("Include cycle.conf", "Include config.d/cycle.conf")
+    if "Include included.conf" in cyc_text:
+        cyc_text = cyc_text.replace("Include included.conf", "Include config.d/included.conf")
+    (config_d / "included.conf").write_text(inc_text)
+    (config_d / "cycle.conf").write_text(cyc_text)
 
     # §13.3: the canary is a private-only reference. fake_home also plants
     # id_canary.pub; drop it so Host canary-test names no fingerprint. The
@@ -264,4 +268,67 @@ def test_unbound_config_references_are_in_snapshot_and_distinguishable(
         snapshot.local_references,
         key=lambda r: (r.source_file or "", r.source_line or 0, r.path),
     )
+    assert open_guard.violations == []
+
+
+def test_config_rules_fire_on_home_basic_end_to_end(
+    home_basic_setup: Path, open_guard: OpenGuard
+) -> None:
+    """AC-4: ScanOrchestrator.run with default rule registry on home_basic produces:
+
+    - snapshot.unresolved containing include_cycle and unsupported_match with file and line
+      (match_not_evaluated parser code mapped to unsupported_match);
+    - snapshot.findings containing CFG001 for missing key and CFG002 for cycle and Match.
+    """
+    orchestrator = ScanOrchestrator(
+        agent_adapter=FakeTimeoutAgent(),  # type: ignore[arg-type]
+        github_adapter=FakeNotAuthenticatedGitHub(),
+    )
+
+    opts = OrchestratorOptions(
+        home=home_basic_setup,
+        ssh_dir=home_basic_setup / ".ssh",
+        config_path=home_basic_setup / ".ssh" / "config",
+        check_agent=True,
+        check_github=True,
+    )
+
+    snapshot = orchestrator.run(opts)
+
+    # 1. snapshot.unresolved contains include_cycle and unsupported_match with file and line
+    unresolved_kinds = {u.kind for u in snapshot.unresolved}
+    assert "include_cycle" in unresolved_kinds
+    assert "unsupported_match" in unresolved_kinds
+    assert "match_not_evaluated" not in unresolved_kinds
+
+    match_items = [u for u in snapshot.unresolved if u.kind == "unsupported_match"]
+    assert len(match_items) >= 1
+    assert match_items[0].source_file.endswith("config")
+    assert match_items[0].source_line == 20
+
+    cycle_items = [u for u in snapshot.unresolved if u.kind == "include_cycle"]
+    assert len(cycle_items) >= 1
+    for item in cycle_items:
+        assert item.source_file.endswith(".conf")
+        assert item.source_line is not None
+
+    # 2. snapshot.findings contains CFG001 on missing key and CFG002 on cycle and Match
+    rule_ids = {f.rule_id for f in snapshot.findings}
+    assert "CFG001" in rule_ids
+    assert "CFG002" in rule_ids
+
+    cfg001_findings = [f for f in snapshot.findings if f.rule_id == "CFG001"]
+    assert any("nonexistent_key" in f.evidence[0].detail for f in cfg001_findings)
+    assert any(list(f.affected_hosts) == ["missing-key"] for f in cfg001_findings)
+    for f in cfg001_findings:
+        assert f.severity is Severity.ERROR
+        assert f.confidence is Confidence.CERTAIN
+
+    cfg002_findings = [f for f in snapshot.findings if f.rule_id == "CFG002"]
+    assert any("cycle" in f.title.lower() or "cycle" in f.summary.lower() for f in cfg002_findings)
+    assert any("match" in f.title.lower() or "match" in f.summary.lower() for f in cfg002_findings)
+    for f in cfg002_findings:
+        assert f.severity is Severity.INFO
+        assert f.confidence is Confidence.UNRESOLVED
+
     assert open_guard.violations == []

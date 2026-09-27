@@ -26,6 +26,7 @@ from ssh_id_doctor.domain import (
     RegistryBinding,
     ScanSnapshot,
     SourceCoverage,
+    UnresolvedItem,
 )
 from ssh_id_doctor.references import (
     ConfigIdentityReference,
@@ -52,6 +53,7 @@ class ScanObservations:
     findings: Sequence[Finding] = ()
     home: str | None = None
     ssh_dir: str | None = None
+    unresolved: Sequence[UnresolvedItem] = ()
 
 
 @dataclass
@@ -337,6 +339,37 @@ def build_snapshot(observations: ScanObservations) -> ScanSnapshot:
     completed_at = observations.completed_at or now_iso
     platform = observations.platform or _detect_platform()
 
+    # 6. Unresolved items from ConfigDocument and observations
+    unresolved_items: list[UnresolvedItem] = list(observations.unresolved)
+    if observations.config_document is not None:
+        for u in observations.config_document.unresolved:
+            kind = "unsupported_match" if u.reason == "match_not_evaluated" else u.reason
+            unresolved_items.append(
+                UnresolvedItem(
+                    kind=kind,
+                    detail=u.detail,
+                    source_file=u.source_file,
+                    source_line=u.source_line,
+                )
+            )
+
+    unique_unresolved: dict[tuple[str, int | None, str, str], UnresolvedItem] = {}
+    for item in unresolved_items:
+        u_key = (item.source_file, item.source_line, item.kind, item.detail)
+        if u_key not in unique_unresolved:
+            unique_unresolved[u_key] = item
+
+    sorted_unresolved = tuple(
+        sorted(
+            unique_unresolved.values(),
+            key=lambda u: (
+                u.source_file,
+                -1 if u.source_line is None else u.source_line,
+                u.kind,
+            ),
+        )
+    )
+
     return ScanSnapshot(
         scan_id=scan_id,
         started_at=started_at,
@@ -347,6 +380,7 @@ def build_snapshot(observations: ScanObservations) -> ScanSnapshot:
         host_bindings=tuple(final_host_bindings),
         findings=sorted_findings,
         local_references=_sorted_unbound(unbound_references),
+        unresolved=sorted_unresolved,
     )
 
 

@@ -17,6 +17,7 @@ from ssh_id_doctor.domain import (
     Resolution,
     ScanSnapshot,
     Severity,
+    UnresolvedItem,
 )
 
 
@@ -99,3 +100,27 @@ def test_scan_snapshot_local_references_is_additive() -> None:
     assert snapshot.schema_version == "1.0"
     with pytest.raises(dataclasses.FrozenInstanceError):
         snapshot.local_references = ()  # type: ignore[misc]
+
+
+def test_unresolved_item_is_frozen() -> None:
+    item = UnresolvedItem(
+        kind="include_cycle",
+        detail="loop.conf",
+        source_file="/home/user/.ssh/config",
+        source_line=5,
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        item.kind = "unsupported_match"  # type: ignore[misc]
+
+
+def test_scan_snapshot_unresolved_is_additive() -> None:
+    snapshot = ScanSnapshot(
+        scan_id="00000000-0000-0000-0000-000000000000",
+        started_at="2026-01-01T00:00:00+00:00",
+        completed_at="2026-01-01T00:00:00+00:00",
+        platform=Platform.LINUX,
+    )
+    assert snapshot.unresolved == ()
+    assert snapshot.schema_version == "1.0"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        snapshot.unresolved = ()  # type: ignore[misc]
