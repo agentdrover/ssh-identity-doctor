@@ -357,6 +357,44 @@ def test_id001_multiple_comments_single_path() -> None:
     assert "label2" in findings[0].summary
 
 
+def test_id001_remediation_follows_the_cause() -> None:
+    """ID001 remediation depends on the cause: labels-only has no duplicate files to consolidate."""
+
+    def _ref(path: str) -> LocalReference:
+        return LocalReference(
+            kind=LocalReferenceKind.PUBLIC_KEY,
+            path=path,
+            source_file=None,
+            source_line=None,
+            resolution=Resolution.RESOLVED,
+        )
+
+    def _remediation(paths: tuple[str, ...], comments: tuple[str, ...]) -> str:
+        ident = Identity(
+            fingerprint="SHA256:labelslabelslabelslabelslabelslabelslabelsL",
+            algorithm="ed25519",
+            bits_or_curve="256",
+            comments=comments,
+            local_references=tuple(_ref(p) for p in paths),
+        )
+        (finding,) = ID001.evaluate(_make_snapshot(identities=(ident,)))
+        _assert_remediation_not_destructive(finding)
+        return " ".join(finding.manual_remediation).lower()
+
+    labels_only = _remediation(("~/.ssh/id_one.pub",), ("label1", "label2"))
+    assert "duplicate key files" not in labels_only
+    assert "canonical path" not in labels_only
+    assert "comment" in labels_only
+
+    paths_only = _remediation(("~/.ssh/a.pub", "~/.ssh/b.pub"), ("same",))
+    assert "duplicate key files" in paths_only
+    assert "comment" not in paths_only
+
+    both = _remediation(("~/.ssh/a.pub", "~/.ssh/b.pub"), ("label1", "label2"))
+    assert "duplicate key files" in both
+    assert "comment" in both
+
+
 def test_id002_with_unresolved_config_notes_in_summary() -> None:
     """ID002 notes that binding may exist in unevaluated config when CFG002 items are present."""
     fp = "SHA256:3333333333333333333333333333333333333333333"

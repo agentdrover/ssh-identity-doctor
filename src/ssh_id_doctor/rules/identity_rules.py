@@ -97,9 +97,17 @@ class ID001Rule:
                     f"{', '.join(distinct_comments)}."
                 )
 
-            remediation = (
-                "Review duplicate key files and consolidate references to the canonical path",
-            )
+            remediation_steps: list[str] = []
+            if has_multiple_paths:
+                remediation_steps.append(
+                    "Review duplicate key files and consolidate references to the canonical path"
+                )
+            if has_multiple_comments:
+                remediation_steps.append(
+                    "Check where this fingerprint appears with each comment and decide "
+                    "which comment to keep as its label"
+                )
+            remediation = tuple(remediation_steps)
 
             findings.append(
                 Finding(
