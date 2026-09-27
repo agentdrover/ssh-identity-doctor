@@ -32,7 +32,7 @@ def test_domain_entities_are_frozen_and_enums_match_spec() -> None:
     identity = Identity(
         fingerprint="SHA256:abc",
         algorithm="ssh-ed25519",
-        bits_or_curve="ED25519",
+        bits_or_curve="256",
         comments=("work",),
         local_references=(ref,),
         agent_presence=False,

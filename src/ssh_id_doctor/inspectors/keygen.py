@@ -38,7 +38,10 @@ _TMP_SUFFIX = ".pub"
 # whitespace, no trailing text) but the fingerprint and the trailing
 # parenthesised algorithm name are required. `.*?` is lazy so a comment that
 # happens to contain "(" still resolves to the *last* parenthesised group.
-_OUTPUT_RE = re.compile(r"^\d+\s+(SHA256:\S+)\s+(.*?)\s*\(([^()]+)\)\s*$")
+# The leading number is the key size (§7.2 ``bits_or_curve``: bits for RSA/DSA,
+# curve size for ECDSA/Ed25519); the parenthesised type is only matched, not
+# kept — the algorithm comes from the .pub line's first field.
+_OUTPUT_RE = re.compile(r"^(\d+)\s+(SHA256:\S+)\s+(.*?)\s*\([^()]+\)\s*$")
 _FINGERPRINT_RE = re.compile(r"^SHA256:[A-Za-z0-9+/]+=*$")
 
 
@@ -131,7 +134,7 @@ def _parse_output(stdout: bytes, algorithm: str) -> KeyInfo | Unresolved:
     match = _OUTPUT_RE.match(line)
     if match is None:
         return Unresolved(reason="unparseable_ssh_keygen_output", detail="unexpected -l format")
-    fingerprint, comment, bits_or_curve = match.groups()
+    bits_or_curve, fingerprint, comment = match.groups()
     if not _FINGERPRINT_RE.match(fingerprint):
         return Unresolved(reason="unparseable_ssh_keygen_output", detail="fingerprint not base64")
     return KeyInfo(
