@@ -1,0 +1,407 @@
+{
+  "completed_at": "2026-09-24T16:00:01+00:00",
+  "findings": [
+    {
+      "affected_fingerprints": [],
+      "affected_hosts": [
+        "missing-key"
+      ],
+      "confidence": "certain",
+      "evidence": [
+        {
+          "detail": "/home/user/.ssh/nonexistent_key",
+          "line": 15,
+          "source": "/home/user/.ssh/config"
+        }
+      ],
+      "id": "CFG001-8bbc58ca0230",
+      "manual_remediation": [
+        "ls -l /home/user/.ssh/nonexistent_key",
+        "ssh -G missing-key"
+      ],
+      "rule_id": "CFG001",
+      "severity": "error",
+      "summary": "IdentityFile '/home/user/.ssh/nonexistent_key' referenced at /home/user/.ssh/config:15 cannot be resolved (missing).",
+      "title": "Unresolved IdentityFile: /home/user/.ssh/nonexistent_key"
+    },
+    {
+      "affected_fingerprints": [
+        "SHA256:+92RsVKGXDDG2XlZkoQSG2sRjqnoPwysscnoHoCIdMk"
+      ],
+      "affected_hosts": [],
+      "confidence": "certain",
+      "evidence": [
+        {
+          "detail": "/home/user/.ssh/id_ed25519.pub",
+          "line": null,
+          "source": "/home/user/.ssh/id_ed25519.pub"
+        },
+        {
+          "detail": "/home/user/.ssh/id_ed25519_copy.pub",
+          "line": null,
+          "source": "/home/user/.ssh/id_ed25519_copy.pub"
+        }
+      ],
+      "id": "ID001-1f08e1ddd077",
+      "manual_remediation": [
+        "Review duplicate key files and consolidate references to the canonical path",
+        "Check where this fingerprint appears with each comment and decide which comment to keep as its label"
+      ],
+      "rule_id": "ID001",
+      "severity": "info",
+      "summary": "Identity SHA256:+92RsVKGXDDG2XlZkoQSG2sRjqnoPwysscnoHoCIdMk appears under multiple local paths (/home/user/.ssh/id_ed25519.pub, /home/user/.ssh/id_ed25519_copy.pub) and distinct comments (copy@example, work@example).",
+      "title": "Duplicate public key paths or labels: SHA256:+92RsVKGXDDG2XlZkoQSG2sRjqnoPwysscnoHoCIdMk"
+    },
+    {
+      "affected_fingerprints": [],
+      "affected_hosts": [],
+      "confidence": "unresolved",
+      "evidence": [
+        {
+          "detail": "Match host specific.example.com",
+          "line": 20,
+          "source": "/home/user/.ssh/config"
+        }
+      ],
+      "id": "CFG002-b331b5a88af6",
+      "manual_remediation": [
+        "Review Match block at /home/user/.ssh/config:20 manually: ssh -G <alias>"
+      ],
+      "rule_id": "CFG002",
+      "severity": "info",
+      "summary": "Match directive at /home/user/.ssh/config:20 is not evaluated: Match host specific.example.com",
+      "title": "Unsupported Match directive in SSH config"
+    },
+    {
+      "affected_fingerprints": [],
+      "affected_hosts": [],
+      "confidence": "unresolved",
+      "evidence": [
+        {
+          "detail": "/home/user/.ssh/config.d/included.conf",
+          "line": 4,
+          "source": "/home/user/.ssh/config.d/cycle.conf"
+        }
+      ],
+      "id": "CFG002-246b5404abe7",
+      "manual_remediation": [
+        "Review include chain around /home/user/.ssh/config.d/cycle.conf:4"
+      ],
+      "rule_id": "CFG002",
+      "severity": "info",
+      "summary": "Recursive Include directive detected at /home/user/.ssh/config.d/cycle.conf:4.",
+      "title": "Include cycle in SSH config: /home/user/.ssh/config.d/included.conf"
+    },
+    {
+      "affected_fingerprints": [],
+      "affected_hosts": [],
+      "confidence": "unresolved",
+      "evidence": [
+        {
+          "detail": "/home/user/.ssh/config.d/cycle.conf",
+          "line": 5,
+          "source": "/home/user/.ssh/config.d/included.conf"
+        }
+      ],
+      "id": "CFG002-88ef68bf63c5",
+      "manual_remediation": [
+        "Review include chain around /home/user/.ssh/config.d/included.conf:5"
+      ],
+      "rule_id": "CFG002",
+      "severity": "info",
+      "summary": "Recursive Include directive detected at /home/user/.ssh/config.d/included.conf:5.",
+      "title": "Include cycle in SSH config: /home/user/.ssh/config.d/cycle.conf"
+    }
+  ],
+  "host_bindings": [
+    {
+      "confidence": "certain",
+      "hostname": "github.com",
+      "identities_only": null,
+      "identity_references": [
+        "~/.ssh/id_ed25519"
+      ],
+      "patterns": [
+        "gh",
+        "github.com"
+      ],
+      "resolved_fingerprints": [
+        "SHA256:+92RsVKGXDDG2XlZkoQSG2sRjqnoPwysscnoHoCIdMk"
+      ],
+      "source_file": "/home/user/.ssh/config",
+      "source_line": 1,
+      "user": "git"
+    },
+    {
+      "confidence": "certain",
+      "hostname": "server.example.com",
+      "identities_only": null,
+      "identity_references": [
+        "~/.ssh/id_rsa"
+      ],
+      "patterns": [
+        "server"
+      ],
+      "resolved_fingerprints": [
+        "SHA256:Kskz06nJKSQVXxudvVa4i2SSMi4R2H2KjSMgpNUyyFE"
+      ],
+      "source_file": "/home/user/.ssh/config",
+      "source_line": 6,
+      "user": "admin"
+    },
+    {
+      "confidence": "unresolved",
+      "hostname": null,
+      "identities_only": null,
+      "identity_references": [
+        "~/.ssh/id_canary"
+      ],
+      "patterns": [
+        "canary-test"
+      ],
+      "resolved_fingerprints": [],
+      "source_file": "/home/user/.ssh/config",
+      "source_line": 11,
+      "user": null
+    },
+    {
+      "confidence": "unresolved",
+      "hostname": null,
+      "identities_only": null,
+      "identity_references": [
+        "~/.ssh/nonexistent_key"
+      ],
+      "patterns": [
+        "missing-key"
+      ],
+      "resolved_fingerprints": [],
+      "source_file": "/home/user/.ssh/config",
+      "source_line": 14,
+      "user": null
+    },
+    {
+      "confidence": "certain",
+      "hostname": null,
+      "identities_only": null,
+      "identity_references": [],
+      "patterns": [
+        "wildcard-test",
+        "*.example.com"
+      ],
+      "resolved_fingerprints": [],
+      "source_file": "/home/user/.ssh/config",
+      "source_line": 17,
+      "user": "wildcard"
+    },
+    {
+      "confidence": "certain",
+      "hostname": null,
+      "identities_only": null,
+      "identity_references": [
+        "~/.ssh/id_rsa"
+      ],
+      "patterns": [
+        "cycle-host"
+      ],
+      "resolved_fingerprints": [
+        "SHA256:Kskz06nJKSQVXxudvVa4i2SSMi4R2H2KjSMgpNUyyFE"
+      ],
+      "source_file": "/home/user/.ssh/config.d/cycle.conf",
+      "source_line": 1,
+      "user": null
+    },
+    {
+      "confidence": "certain",
+      "hostname": null,
+      "identities_only": null,
+      "identity_references": [
+        "~/.ssh/id_rsa"
+      ],
+      "patterns": [
+        "cycle-host"
+      ],
+      "resolved_fingerprints": [
+        "SHA256:Kskz06nJKSQVXxudvVa4i2SSMi4R2H2KjSMgpNUyyFE"
+      ],
+      "source_file": "/home/user/.ssh/config.d/cycle.conf",
+      "source_line": 1,
+      "user": null
+    },
+    {
+      "confidence": "certain",
+      "hostname": "inc.example.com",
+      "identities_only": null,
+      "identity_references": [
+        "~/.ssh/id_ed25519"
+      ],
+      "patterns": [
+        "included-host"
+      ],
+      "resolved_fingerprints": [
+        "SHA256:+92RsVKGXDDG2XlZkoQSG2sRjqnoPwysscnoHoCIdMk"
+      ],
+      "source_file": "/home/user/.ssh/config.d/included.conf",
+      "source_line": 1,
+      "user": null
+    },
+    {
+      "confidence": "certain",
+      "hostname": "inc.example.com",
+      "identities_only": null,
+      "identity_references": [
+        "~/.ssh/id_ed25519"
+      ],
+      "patterns": [
+        "included-host"
+      ],
+      "resolved_fingerprints": [
+        "SHA256:+92RsVKGXDDG2XlZkoQSG2sRjqnoPwysscnoHoCIdMk"
+      ],
+      "source_file": "/home/user/.ssh/config.d/included.conf",
+      "source_line": 1,
+      "user": null
+    }
+  ],
+  "identities": [
+    {
+      "agent_presence": false,
+      "algorithm": "ssh-ed25519",
+      "bits_or_curve": "256",
+      "comments": [
+        "copy@example",
+        "work@example"
+      ],
+      "fingerprint": "SHA256:+92RsVKGXDDG2XlZkoQSG2sRjqnoPwysscnoHoCIdMk",
+      "local_references": [
+        {
+          "kind": "config_identity",
+          "path": "/home/user/.ssh/id_ed25519",
+          "resolution": "resolved",
+          "source_file": "/home/user/.ssh/config",
+          "source_line": 4
+        },
+        {
+          "kind": "config_identity",
+          "path": "/home/user/.ssh/id_ed25519",
+          "resolution": "resolved",
+          "source_file": "/home/user/.ssh/config.d/included.conf",
+          "source_line": 3
+        },
+        {
+          "kind": "public_key",
+          "path": "/home/user/.ssh/id_ed25519.pub",
+          "resolution": "resolved",
+          "source_file": null,
+          "source_line": null
+        },
+        {
+          "kind": "public_key",
+          "path": "/home/user/.ssh/id_ed25519_copy.pub",
+          "resolution": "resolved",
+          "source_file": null,
+          "source_line": null
+        }
+      ],
+      "registry_bindings": []
+    },
+    {
+      "agent_presence": false,
+      "algorithm": "ssh-rsa",
+      "bits_or_curve": "3072",
+      "comments": [
+        "work-rsa@example"
+      ],
+      "fingerprint": "SHA256:Kskz06nJKSQVXxudvVa4i2SSMi4R2H2KjSMgpNUyyFE",
+      "local_references": [
+        {
+          "kind": "config_identity",
+          "path": "/home/user/.ssh/id_rsa",
+          "resolution": "resolved",
+          "source_file": "/home/user/.ssh/config",
+          "source_line": 9
+        },
+        {
+          "kind": "config_identity",
+          "path": "/home/user/.ssh/id_rsa",
+          "resolution": "resolved",
+          "source_file": "/home/user/.ssh/config.d/cycle.conf",
+          "source_line": 2
+        },
+        {
+          "kind": "public_key",
+          "path": "/home/user/.ssh/id_rsa.pub",
+          "resolution": "resolved",
+          "source_file": null,
+          "source_line": null
+        }
+      ],
+      "registry_bindings": []
+    }
+  ],
+  "local_references": [
+    {
+      "kind": "config_identity",
+      "path": "/home/user/.ssh/id_canary",
+      "resolution": "private_only",
+      "source_file": "/home/user/.ssh/config",
+      "source_line": 12
+    },
+    {
+      "kind": "config_identity",
+      "path": "/home/user/.ssh/nonexistent_key",
+      "resolution": "missing",
+      "source_file": "/home/user/.ssh/config",
+      "source_line": 15
+    }
+  ],
+  "platform": "linux",
+  "scan_id": "00000000-0000-0000-0000-000000000000",
+  "schema_version": "1.0",
+  "sources": [
+    {
+      "detail": "ssh-add timed out",
+      "required": false,
+      "source": "agent",
+      "state": "timeout"
+    },
+    {
+      "detail": "9 host blocks parsed",
+      "required": false,
+      "source": "config",
+      "state": "available"
+    },
+    {
+      "detail": "3 public keys discovered",
+      "required": true,
+      "source": "filesystem",
+      "state": "available"
+    },
+    {
+      "detail": "gh: not authenticated",
+      "required": false,
+      "source": "github",
+      "state": "unavailable"
+    }
+  ],
+  "started_at": "2026-09-24T16:00:00+00:00",
+  "unresolved": [
+    {
+      "detail": "Match host specific.example.com",
+      "kind": "unsupported_match",
+      "source_file": "/home/user/.ssh/config",
+      "source_line": 20
+    },
+    {
+      "detail": "/home/user/.ssh/config.d/included.conf",
+      "kind": "include_cycle",
+      "source_file": "/home/user/.ssh/config.d/cycle.conf",
+      "source_line": 4
+    },
+    {
+      "detail": "/home/user/.ssh/config.d/cycle.conf",
+      "kind": "include_cycle",
+      "source_file": "/home/user/.ssh/config.d/included.conf",
+      "source_line": 5
+    }
+  ]
+}
