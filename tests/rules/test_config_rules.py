@@ -158,6 +158,57 @@ def test_cfg001_unreadable_and_outside_root_and_global_host() -> None:
     assert findings[1].severity is Severity.ERROR
 
 
+def test_cfg001_identityfile_inside_match_after_host_has_no_affected_hosts() -> None:
+    """A Match line closes the preceding Host block (finding d7e2d2a1d7a1ab3b).
+
+    Mirrors home_basic: Host wildcard-test at 17, Match at 20, IdentityFile at 21.
+    The reference inside Match belongs to no Host block, so affected_hosts is
+    empty; a reference inside the Host block still gets its patterns.
+    """
+    in_match = LocalReference(
+        kind=LocalReferenceKind.CONFIG_IDENTITY,
+        path="~/.ssh/gone_in_match",
+        source_file="config",
+        source_line=21,
+        resolution=Resolution.MISSING,
+    )
+    in_host = LocalReference(
+        kind=LocalReferenceKind.CONFIG_IDENTITY,
+        path="~/.ssh/gone_in_host",
+        source_file="config",
+        source_line=18,
+        resolution=Resolution.MISSING,
+    )
+    host_binding = HostBinding(
+        patterns=("wildcard-test", "*.example.com"),
+        hostname=None,
+        user="wildcard",
+        identity_references=("~/.ssh/gone_in_host",),
+        resolved_fingerprints=(),
+        identities_only=None,
+        source_file="config",
+        source_line=17,
+        confidence=Confidence.UNRESOLVED,
+    )
+    match = UnresolvedItem(
+        kind="unsupported_match",
+        detail="Match host specific.example.com",
+        source_file="config",
+        source_line=20,
+    )
+    snapshot = _make_snapshot(
+        local_references=(in_match, in_host),
+        host_bindings=(host_binding,),
+        unresolved=(match,),
+    )
+
+    by_path = {f.evidence[0].detail: f for f in CFG001.evaluate(snapshot)}
+
+    assert set(by_path) == {"~/.ssh/gone_in_match", "~/.ssh/gone_in_host"}
+    assert by_path["~/.ssh/gone_in_match"].affected_hosts == ()
+    assert by_path["~/.ssh/gone_in_host"].affected_hosts == ("wildcard-test", "*.example.com")
+
+
 def test_cfg002_reports_cycle_match_and_token_as_unresolved() -> None:
     """AC-3: A snapshot with UnresolvedItem include_cycle (loop.conf:1),
 

@@ -41,6 +41,36 @@ _CFG002_KINDS: frozenset[str] = frozenset(
 )
 
 
+def _enclosing_host_patterns(ref: LocalReference, snapshot: ScanSnapshot) -> tuple[str, ...]:
+    """Patterns of the Host block that owns the reference line, or ().
+
+    In ssh_config a block ends at the next ``Host`` or ``Match`` line. The
+    nearest of either at or above the reference in the same file is its block
+    header: a ``Host`` header gives its patterns; a ``Match`` header (known
+    from ``snapshot.unresolved``, kind ``unsupported_match``) or no header at
+    all (a global reference) gives an empty tuple.
+    """
+    if ref.source_file is None or ref.source_line is None:
+        return ()
+    line = ref.source_line
+    best_line = -1
+    best_patterns: tuple[str, ...] = ()
+    for hb in snapshot.host_bindings:
+        if hb.source_file == ref.source_file and best_line < hb.source_line <= line:
+            best_line = hb.source_line
+            best_patterns = hb.patterns
+    for item in snapshot.unresolved:
+        if (
+            item.kind == "unsupported_match"
+            and item.source_file == ref.source_file
+            and item.source_line is not None
+            and best_line < item.source_line <= line
+        ):
+            best_line = item.source_line
+            best_patterns = ()
+    return best_patterns
+
+
 class CFG001Rule:
     """CFG001: IdentityFile target cannot be resolved (missing/unreadable/outside_root).
 
@@ -77,16 +107,7 @@ class CFG001Rule:
 
         findings: list[Finding] = []
         for ref in broken_refs:
-            affected_hosts: tuple[str, ...] = ()
-            if ref.source_file is not None and ref.source_line is not None:
-                best_line = -1
-                best_patterns: tuple[str, ...] = ()
-                for hb in snapshot.host_bindings:
-                    if hb.source_file == ref.source_file and hb.source_line <= ref.source_line:
-                        if hb.source_line > best_line:
-                            best_line = hb.source_line
-                            best_patterns = hb.patterns
-                affected_hosts = best_patterns
+            affected_hosts = _enclosing_host_patterns(ref, snapshot)
 
             evidence = (
                 EvidenceReference(
