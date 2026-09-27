@@ -60,7 +60,7 @@ def test_agent_with_identities_normalized(monkeypatch: pytest.MonkeyPatch) -> No
     assert isinstance(id1, Identity)
     assert id1.fingerprint == "SHA256:+92RsVKGXDDG2XlZkoQSG2sRjqnoPwysscnoHoCIdMk"
     assert id1.algorithm == "ssh-ed25519"
-    assert id1.bits_or_curve == "ED25519"
+    assert id1.bits_or_curve == "256"
     assert id1.comments == ("work",)
     assert id1.agent_presence is True
     assert id1.local_references == ()
@@ -69,7 +69,7 @@ def test_agent_with_identities_normalized(monkeypatch: pytest.MonkeyPatch) -> No
     assert isinstance(id2, Identity)
     assert id2.fingerprint == "SHA256:Kskz06nJKSQVXxudvVa4i2SSMi4R2H2KjSMgpNUyyFE"
     assert id2.algorithm == "ssh-rsa"
-    assert id2.bits_or_curve == "RSA"
+    assert id2.bits_or_curve == "3072"
     assert id2.comments == ()
     assert id2.agent_presence is True
     assert id2.local_references == ()

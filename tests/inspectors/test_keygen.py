@@ -61,15 +61,15 @@ def test_fingerprint_ed25519_matches_recorded_output(
     assert info.fingerprint.startswith("SHA256:")
     assert info.fingerprint == "SHA256:+92RsVKGXDDG2XlZkoQSG2sRjqnoPwysscnoHoCIdMk"
     assert info.algorithm == "ssh-ed25519"
-    assert info.bits_or_curve == "ED25519"
+    assert info.bits_or_curve == "256"
     assert info.comment == "work@example"
 
 
 @pytest.mark.parametrize(
     ("fixture_name", "algorithm", "bits_or_curve"),
     [
-        ("rsa3072", "ssh-rsa", "RSA"),
-        ("ecdsa256", "ecdsa-sha2-nistp256", "ECDSA"),
+        ("rsa3072", "ssh-rsa", "3072"),
+        ("ecdsa256", "ecdsa-sha2-nistp256", "256"),
     ],
 )
 def test_fingerprint_matches_recorded_output_for_other_key_families(
@@ -245,7 +245,7 @@ def test_output_with_extra_whitespace_and_no_comment_still_parses(
 
     assert isinstance(result, KeyInfo)
     assert result.fingerprint == "SHA256:abcDEF123+/="
-    assert result.bits_or_curve == "ED25519"
+    assert result.bits_or_curve == "256"
     assert result.comment == ""
 
 

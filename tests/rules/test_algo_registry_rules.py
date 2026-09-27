@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import dataclasses
 import re
+from pathlib import Path
 
 import pytest
 
+from ssh_id_doctor.aggregate import ScanObservations, build_snapshot
 from ssh_id_doctor.domain import (
     Confidence,
     CoverageState,
@@ -22,6 +24,8 @@ from ssh_id_doctor.domain import (
     SourceCoverage,
     UnresolvedItem,
 )
+from ssh_id_doctor.inspectors.keygen import KeyInfo, PublicKeyInspector
+from ssh_id_doctor.process import ProcessResult, ProcessStatus
 from ssh_id_doctor.rules import get_default_rules, run_rules
 from ssh_id_doctor.rules.algo_registry_rules import (
     ALG001,
@@ -30,6 +34,16 @@ from ssh_id_doctor.rules.algo_registry_rules import (
     RULES,
     ALG001Rule,
     REG001Rule,
+)
+from ssh_id_doctor.scanner import PublicKeyObservation
+
+KEY_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "keys"
+
+# Recorded shape of `ssh-keygen -l -E sha256 -f <rsa-1024.pub>`; no real key is
+# generated or stored — the inspector only sees this text through a fake run.
+_RSA1024_PUB = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQDshortrsa1024notarealkey short@example"
+_RSA1024_KEYGEN_OUT = (
+    "1024 SHA256:ShortRsa1024RecordedOutput0000000000000000000 short@example (RSA)\n"
 )
 
 
@@ -154,6 +168,57 @@ def test_alg001_flags_dsa_and_short_rsa_only() -> None:
             "redundant" in rem.lower() or "backup" in rem.lower()
             for rem in finding.manual_remediation
         )
+
+
+def _snapshot_via_keygen(
+    monkeypatch: pytest.MonkeyPatch, pub_line: str, keygen_stdout: str
+) -> ScanSnapshot:
+    """PublicKeyInspector on recorded ssh-keygen output -> build_snapshot, as a scan does."""
+
+    def fake_run(argv: list[str], *, timeout: float, max_output: int) -> ProcessResult:
+        assert argv[0] == "ssh-keygen"
+        return ProcessResult(ProcessStatus.OK, 0, keygen_stdout.encode(), b"", False)
+
+    monkeypatch.setattr("ssh_id_doctor.inspectors.keygen.process.run", fake_run)
+    info = PublicKeyInspector().fingerprint(pub_line)
+    assert isinstance(info, KeyInfo)
+    observation = PublicKeyObservation(path="/home/u/.ssh/id.pub", resolution=Resolution.RESOLVED)
+    return build_snapshot(ScanObservations(public_keys=[(observation, info)]))
+
+
+def test_alg001_flags_short_rsa_from_real_ssh_keygen_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 900d1c6ba5b063f2: ALG001 on a snapshot built from ssh-keygen output.
+
+    RSA 1024 through PublicKeyInspector -> Identity is flagged; the recorded
+    rsa3072 fixture is not. Synthetic bits_or_curve cannot hide the inspector's shape.
+    """
+    short = _snapshot_via_keygen(monkeypatch, _RSA1024_PUB, _RSA1024_KEYGEN_OUT)
+    (ident,) = short.identities
+    assert ident.algorithm == "ssh-rsa"
+    findings = ALG001.evaluate(short)
+    assert [f.affected_fingerprints for f in findings] == [(ident.fingerprint,)]
+    assert findings[0].confidence is Confidence.CERTAIN
+
+    modern = _snapshot_via_keygen(
+        monkeypatch,
+        (KEY_FIXTURES / "rsa3072.pub").read_text().strip("\n"),
+        (KEY_FIXTURES / "rsa3072.sha256.txt").read_text(),
+    )
+    assert len(modern.identities) == 1
+    assert ALG001.evaluate(modern) == []
+
+
+@pytest.mark.parametrize("unreadable", ["", "RSA", "unknown"])
+def test_alg001_rsa_with_unreadable_size_is_not_a_certain_finding(unreadable: str) -> None:
+    """A size nobody could read is not certainly short: skipped, never guessed."""
+    ident = Identity(
+        fingerprint="SHA256:rsaunknownsize000000000000000000000000000",
+        algorithm="ssh-rsa",
+        bits_or_curve=unreadable,
+    )
+    assert ALG001.evaluate(_make_snapshot(identities=(ident,))) == []
 
 
 def test_reg001_github_key_without_local_or_agent_match() -> None:

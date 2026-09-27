@@ -32,7 +32,7 @@ def test_same_fingerprint_merged_with_all_relationships() -> None:
     """
     fingerprint = "SHA256:u1234567890abcdef1234567890abcdef1234567890"
     algo = "ssh-ed25519"
-    bits = "ED25519"
+    bits = "256"
     key_info = KeyInfo(
         fingerprint=fingerprint,
         algorithm=algo,

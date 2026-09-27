@@ -35,6 +35,8 @@ Key: algorithm name (normalized wire format).
 Value: minimum bit length required (None if all keys of this algorithm are legacy).
 """
 
+_SIZE_RE = re.compile(r"\d+")
+
 
 def _normalize_algo(algo: str) -> str:
     norm = algo.strip().lower()
@@ -45,15 +47,32 @@ def _normalize_algo(algo: str) -> str:
     return norm
 
 
-def _extract_bits(bits_or_curve: object) -> int | None:
-    if isinstance(bits_or_curve, int):
+def _key_size(bits_or_curve: object) -> int | None:
+    """The key size from §7.2 ``bits_or_curve``, or None when it is not a plain number.
+
+    PublicKeyInspector stores the leading number of ``ssh-keygen -l`` output
+    ("3072", "1024", "256"). Anything else — an empty field, a type name like
+    "RSA" — is an unknown size, never a guess pulled out of some other text.
+    """
+    if isinstance(bits_or_curve, int) and not isinstance(bits_or_curve, bool):
         return bits_or_curve
-    if not isinstance(bits_or_curve, str):
-        return None
-    match = re.search(r"\d+", bits_or_curve)
-    if match:
-        return int(match.group())
+    if isinstance(bits_or_curve, str) and _SIZE_RE.fullmatch(bits_or_curve.strip()):
+        return int(bits_or_curve.strip())
     return None
+
+
+def _below_threshold(ident: Identity, threshold: int) -> bool:
+    """True only when the key size is known and below ``threshold``.
+
+    An unreadable size is deliberately NOT a finding: ALG001 is ``certain``,
+    and "this RSA key is short" cannot be certain without the size. Guessing
+    would either miss short keys silently or flag every RSA key, and the
+    security-review constraint forbids pushing people into rushed rotation.
+    Since SID-4 stores the numeric size, this branch is only reached for
+    identities whose size no inspector could read (e.g. GitHub-only keys).
+    """
+    bits = _key_size(ident.bits_or_curve)
+    return bits is not None and bits < threshold
 
 
 def _is_legacy_identity(
@@ -76,16 +95,10 @@ def _is_legacy_identity(
         threshold = legacy[target_key]
         if threshold is None:
             return True
-        bits = _extract_bits(ident.bits_or_curve)
-        if bits is None:
-            bits = _extract_bits(ident.algorithm)
-        return bits is not None and bits < threshold
+        return _below_threshold(ident, threshold)
 
     if target_key in ("ssh-rsa", "rsa"):
-        bits = _extract_bits(ident.bits_or_curve)
-        if bits is None:
-            bits = _extract_bits(ident.algorithm)
-        return bits is not None and bits < 2048
+        return _below_threshold(ident, 2048)
     return True
 
 
