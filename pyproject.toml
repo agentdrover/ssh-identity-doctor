@@ -38,6 +38,7 @@ addopts = "-p no:cacheprovider"
 
 [dependency-groups]
 dev = [
+    "jsonschema==4.26.0",
     "mypy==1.18.2",
     "pytest==8.4.2",
     "ruff==0.13.1",
