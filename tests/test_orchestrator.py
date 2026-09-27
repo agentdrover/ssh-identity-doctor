@@ -357,12 +357,19 @@ def _scan_home_basic(home: Path) -> ScanSnapshot:
 
 
 def test_finding_ids_do_not_depend_on_the_scanned_home_root(
-    home_basic_setup: Path, tmp_path_factory: pytest.TempPathFactory
+    home_basic_setup: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    open_guard: OpenGuard,
 ) -> None:
     """Finding 8425fb9af74bb35b: the same home_basic layout under two different
     HOME roots yields the same finding ids (paths under HOME hash as '~/...'),
-    while the evidence in each Finding keeps that scan's real paths."""
-    other_home = _populate_home_basic(tmp_path_factory.mktemp("another-root") / "someone")
+    while the evidence in each Finding keeps that scan's real paths.
+
+    The second root is not $HOME, so it is put under the open guard as well:
+    its private id_canary is as protected as the one in fake_home."""
+    other_home = tmp_path_factory.mktemp("another-root") / "someone"
+    open_guard.guard_root(other_home)
+    _populate_home_basic(other_home)
     assert str(other_home) != str(home_basic_setup)
 
     first = _scan_home_basic(home_basic_setup)
@@ -379,3 +386,5 @@ def test_finding_ids_do_not_depend_on_the_scanned_home_root(
     second_cfg001 = next(f for f in second.findings if f.rule_id == "CFG001")
     assert first_cfg001.evidence[0].source.startswith(str(home_basic_setup))
     assert second_cfg001.evidence[0].source.startswith(str(other_home))
+
+    assert open_guard.violations == []

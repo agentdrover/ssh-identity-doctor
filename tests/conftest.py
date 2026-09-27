@@ -53,6 +53,16 @@ class OpenGuard:
     home: str
     violations: list[str] = field(default_factory=list)
     allowed: set[str] = field(default_factory=set)
+    extra_roots: list[str] = field(default_factory=list)
+
+    def guard_root(self, *roots: str | os.PathLike[str]) -> None:
+        """Protect another synthetic HOME with the same rules as ``home``.
+
+        Additive only: ``home`` stays guarded; for a test that scans a
+        directory other than $HOME (e.g. a second HOME root).
+        """
+        for root in roots:
+            self.extra_roots.append(os.path.realpath(os.fsdecode(os.fspath(root))))
 
     def allow(self, *paths: str | os.PathLike[str]) -> None:
         """Permit a read of exactly these real paths, for one test.
@@ -68,7 +78,10 @@ class OpenGuard:
             return False
         raw = os.fsdecode(os.fspath(file))
         real = os.path.realpath(raw)
-        inside = real == self.home or real.startswith(self.home + os.sep)
+        inside = any(
+            real == root or real.startswith(root + os.sep)
+            for root in (self.home, *self.extra_roots)
+        )
         if not inside:
             return False
         if real in self.allowed:
