@@ -299,6 +299,7 @@ class ScanOrchestrator:
             findings=tuple(findings),
             schema_version=intermediate_snapshot.schema_version,
             local_references=intermediate_snapshot.local_references,
+            unresolved=intermediate_snapshot.unresolved,
         )
 
 

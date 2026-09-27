@@ -141,6 +141,16 @@ class Finding:
 
 
 @dataclass(frozen=True, slots=True)
+class UnresolvedItem:
+    """One parser or source item that could not be resolved (§7)."""
+
+    kind: str
+    detail: str
+    source_file: str
+    source_line: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ScanSnapshot:
     """§7.1. Timestamps are ISO-8601 strings, scan_id a UUID string."""
 
@@ -157,3 +167,4 @@ class ScanSnapshot:
     """References bound to no Identity (no fingerprint: missing, private_only,
     unreadable, outside_root), sorted by (source_file, source_line, path).
     Additive to schema 1.0; bound references live in Identity.local_references."""
+    unresolved: tuple[UnresolvedItem, ...] = ()
