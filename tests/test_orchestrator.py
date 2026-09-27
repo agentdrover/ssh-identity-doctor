@@ -45,10 +45,10 @@ class FakeNotAuthenticatedGitHub:
         )
 
 
-@pytest.fixture
-def home_basic_setup(fake_home: Path) -> Path:
-    """Populate synthetic HOME with fixtures/home_basic contents."""
-    ssh = fake_home / ".ssh"
+def _populate_home_basic(home: Path) -> Path:
+    """Lay fixtures/home_basic out as HOME/.ssh under any root. Returns HOME."""
+    ssh = home / ".ssh"
+    ssh.mkdir(mode=0o700, parents=True, exist_ok=True)
     # Copy files from fixtures/home_basic to synthetic fake_home
     (ssh / "id_ed25519.pub").write_text((FIXTURES_HOME / "id_ed25519.pub").read_text())
     (ssh / "id_ed25519_copy.pub").write_text((FIXTURES_HOME / "id_ed25519_copy.pub").read_text())
@@ -69,11 +69,17 @@ def home_basic_setup(fake_home: Path) -> Path:
     # §13.3: the canary is a private-only reference. fake_home also plants
     # id_canary.pub; drop it so Host canary-test names no fingerprint. The
     # private trap id_canary stays (0600) and the open guard stays armed.
-    (ssh / "id_canary.pub").unlink()
+    (ssh / "id_canary.pub").unlink(missing_ok=True)
     (ssh / "id_canary").write_text(CANARY_PRIVATE_KEY)
     (ssh / "id_canary").chmod(0o600)
 
-    return fake_home
+    return home
+
+
+@pytest.fixture
+def home_basic_setup(fake_home: Path) -> Path:
+    """Populate synthetic HOME with fixtures/home_basic contents."""
+    return _populate_home_basic(fake_home)
 
 
 def test_optional_source_failures_keep_local_results(
@@ -330,5 +336,55 @@ def test_config_rules_fire_on_home_basic_end_to_end(
     for f in cfg002_findings:
         assert f.severity is Severity.INFO
         assert f.confidence is Confidence.UNRESOLVED
+
+    assert open_guard.violations == []
+
+
+def _scan_home_basic(home: Path) -> ScanSnapshot:
+    orchestrator = ScanOrchestrator(
+        agent_adapter=FakeTimeoutAgent(),  # type: ignore[arg-type]
+        github_adapter=FakeNotAuthenticatedGitHub(),
+    )
+    return orchestrator.run(
+        OrchestratorOptions(
+            home=home,
+            ssh_dir=home / ".ssh",
+            config_path=home / ".ssh" / "config",
+            check_agent=True,
+            check_github=True,
+        )
+    )
+
+
+def test_finding_ids_do_not_depend_on_the_scanned_home_root(
+    home_basic_setup: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    open_guard: OpenGuard,
+) -> None:
+    """Finding 8425fb9af74bb35b: the same home_basic layout under two different
+    HOME roots yields the same finding ids (paths under HOME hash as '~/...'),
+    while the evidence in each Finding keeps that scan's real paths.
+
+    The second root is not $HOME, so it is put under the open guard as well:
+    its private id_canary is as protected as the one in fake_home."""
+    other_home = tmp_path_factory.mktemp("another-root") / "someone"
+    open_guard.guard_root(other_home)
+    _populate_home_basic(other_home)
+    assert str(other_home) != str(home_basic_setup)
+
+    first = _scan_home_basic(home_basic_setup)
+    second = _scan_home_basic(other_home)
+
+    first_ids = {f.id for f in first.findings}
+    second_ids = {f.id for f in second.findings}
+    assert first_ids
+    assert {f.rule_id for f in first.findings} >= {"CFG001", "CFG002", "ID001"}
+    assert first_ids == second_ids
+
+    # Evidence is not rewritten: each scan shows its own absolute paths.
+    first_cfg001 = next(f for f in first.findings if f.rule_id == "CFG001")
+    second_cfg001 = next(f for f in second.findings if f.rule_id == "CFG001")
+    assert first_cfg001.evidence[0].source.startswith(str(home_basic_setup))
+    assert second_cfg001.evidence[0].source.startswith(str(other_home))
 
     assert open_guard.violations == []

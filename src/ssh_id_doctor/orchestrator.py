@@ -283,7 +283,11 @@ class ScanOrchestrator:
         intermediate_snapshot = build_snapshot(obs)
 
         # 7. RulesEngine
-        findings = run_rules(intermediate_snapshot, rules=opts.rules)
+        findings = run_rules(
+            intermediate_snapshot,
+            rules=opts.rules,
+            home_roots=(str(home), os.path.realpath(home)),
+        )
 
         completed_at = datetime.now(UTC).isoformat()
 
