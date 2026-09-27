@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+import re
 from typing import TYPE_CHECKING
 
 from ssh_id_doctor.domain import (
@@ -49,6 +51,35 @@ def _make_snapshot(
         host_bindings=host_bindings,
         unresolved=unresolved,
     )
+
+
+_DESTRUCTIVE_REMEDIATION = re.compile(
+    r"\brm\b|sed\s+-i|ssh-add\s+-[dD]\b|\bdelete\b|\bdeleted\b|safe to remove",
+    re.IGNORECASE,
+)
+
+
+def _all_strings(obj: object) -> list[str]:
+    """Every string reachable from a finding: all fields, nested evidence, tuples."""
+    if isinstance(obj, str):
+        return [obj]
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return [s for f in dataclasses.fields(obj) for s in _all_strings(getattr(obj, f.name))]
+    if isinstance(obj, (tuple, list)):
+        return [s for item in obj for s in _all_strings(item)]
+    if obj is None or isinstance(obj, (int, bool)):
+        return []
+    return [str(obj)]
+
+
+def _assert_never_says_unused(finding: object) -> None:
+    for text in _all_strings(finding):
+        assert "unused" not in text.lower(), f"'unused' found in finding text: {text!r}"
+
+
+def _assert_remediation_not_destructive(finding: object) -> None:
+    for rem in getattr(finding, "manual_remediation", ()):
+        assert not _DESTRUCTIVE_REMEDIATION.search(rem), f"destructive remediation: {rem!r}"
 
 
 def test_id001_same_fingerprint_multiple_paths() -> None:
@@ -114,11 +145,8 @@ def test_id001_same_fingerprint_multiple_paths() -> None:
     assert "~/.ssh/backup/a.pub" in (evidence_sources | evidence_details)
     assert len(finding.evidence) == 2
 
-    assert "unused" not in finding.title.lower()
-    assert "unused" not in finding.summary.lower()
-    for rem in finding.manual_remediation:
-        assert "unused" not in rem.lower()
-        assert "rm " not in rem
+    _assert_never_says_unused(finding)
+    _assert_remediation_not_destructive(finding)
 
 
 def test_id002_no_known_binding_never_says_unused() -> None:
@@ -190,25 +218,9 @@ def test_id002_no_known_binding_never_says_unused() -> None:
     assert "no known binding" in finding.title.lower()
     assert "no known binding" in finding.summary.lower()
 
-    # SEC-006 & FR-008: 'unused' must NOT appear in ANY field (case-insensitive)
-    for field_name in (
-        "id",
-        "rule_id",
-        "severity",
-        "confidence",
-        "title",
-        "summary",
-    ):
-        val = str(getattr(finding, field_name)).lower()
-        assert "unused" not in val, f"Field {field_name} contains 'unused': {val}"
-
-    for ev in finding.evidence:
-        assert "unused" not in ev.source.lower()
-        assert "unused" not in ev.detail.lower()
-
-    for rem in finding.manual_remediation:
-        assert "unused" not in rem.lower()
-        assert "rm " not in rem
+    # SEC-006 & FR-008: 'unused' must NOT appear in ANY field, nested ones included
+    _assert_never_says_unused(finding)
+    _assert_remediation_not_destructive(finding)
 
 
 def test_lab001_empty_and_ambiguous_comments() -> None:
@@ -311,13 +323,10 @@ def test_lab001_empty_and_ambiguous_comments() -> None:
     s_findings = [f for f in findings if fp_s in f.affected_fingerprints]
     assert s_findings == []
 
-    # None should have 'unused'
+    # None should say 'unused' in any field or suggest destructive remediation
     for f in findings:
-        assert "unused" not in f.title.lower()
-        assert "unused" not in f.summary.lower()
-        for rem in f.manual_remediation:
-            assert "unused" not in rem.lower()
-            assert "rm " not in rem
+        _assert_never_says_unused(f)
+        _assert_remediation_not_destructive(f)
 
 
 def test_id001_multiple_comments_single_path() -> None:
@@ -428,6 +437,76 @@ def test_id002_ignores_agent_only_identity() -> None:
     findings = ID002.evaluate(snapshot)
 
     assert findings == []
+
+
+def test_id002_agent_presence_is_not_a_binding() -> None:
+    """Being loaded in the agent is exposure, not a binding: ID002 still fires."""
+    fp = "SHA256:8888888888888888888888888888888888888888888"
+    ref = LocalReference(
+        kind=LocalReferenceKind.PUBLIC_KEY,
+        path="~/.ssh/id_agent_loaded.pub",
+        source_file=None,
+        source_line=None,
+        resolution=Resolution.RESOLVED,
+    )
+    ident = Identity(
+        fingerprint=fp,
+        algorithm="ed25519",
+        bits_or_curve="256",
+        comments=("loaded",),
+        local_references=(ref,),
+        agent_presence=True,
+    )
+    findings = ID002.evaluate(_make_snapshot(identities=(ident,)))
+
+    assert [f.affected_fingerprints for f in findings] == [(fp,)]
+    assert "no known binding" in findings[0].title.lower()
+
+
+def test_remediation_never_destructive_across_identity_rules() -> None:
+    """SEC-006: no rule suggests rm, sed -i, ssh-add -d/-D or promises deletion is safe."""
+    fp_dup = "SHA256:9999999999999999999999999999999999999999999"
+    fp_other = "SHA256:0000000000000000000000000000000000000000000"
+    refs = tuple(
+        LocalReference(
+            kind=LocalReferenceKind.PUBLIC_KEY,
+            path=path,
+            source_file=None,
+            source_line=None,
+            resolution=Resolution.RESOLVED,
+        )
+        for path in ("~/.ssh/a.pub", "~/.ssh/b.pub", "~/.ssh/c.pub")
+    )
+    ident_dup = Identity(
+        fingerprint=fp_dup,
+        algorithm="ed25519",
+        bits_or_curve="256",
+        comments=("",),
+        local_references=refs[:2],
+    )
+    ident_a = Identity(
+        fingerprint=fp_other,
+        algorithm="ed25519",
+        bits_or_curve="256",
+        comments=("shared",),
+        local_references=refs[2:],
+    )
+    ident_b = Identity(
+        fingerprint="SHA256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeE",
+        algorithm="ed25519",
+        bits_or_curve="256",
+        comments=("shared",),
+        agent_presence=True,
+    )
+    snapshot = _make_snapshot(identities=(ident_dup, ident_a, ident_b))
+
+    findings = [f for rule in RULES for f in rule.evaluate(snapshot)]
+    assert {f.rule_id for f in findings} == {"ID001", "ID002", "LAB001"}
+    assert len([f for f in findings if f.rule_id == "LAB001"]) == 2  # empty + shared
+    for f in findings:
+        assert f.manual_remediation, f"{f.rule_id} has no remediation"
+        _assert_remediation_not_destructive(f)
+        _assert_never_says_unused(f)
 
 
 def test_lab001_whitespace_only_comment_treated_as_empty() -> None:
