@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 from pathlib import Path
@@ -86,7 +87,6 @@ def _normalize_report(text: str, home_path: str) -> str:
         "2026-09-24T16:00:00+00:00",
         res,
     )
-    res = re.sub(r"([A-Z0-9]+)-[0-9a-f]{12}", r"\1-<DIGEST>", res)
     return res
 
 
@@ -251,7 +251,9 @@ def test_examples_match_a_fresh_real_scan_of_home_basic(
         check_agent=True,
         check_github=True,
     )
-    fresh_snapshot = orchestrator.run(opts)
+    # The examples document a Linux scan; platform is a fact of the host, not of
+    # home_basic, so it is pinned on the input instead of masked in the output.
+    fresh_snapshot = dataclasses.replace(orchestrator.run(opts), platform=Platform.LINUX)
 
     fresh_md = render_markdown(fresh_snapshot)
     fresh_json = render_json(fresh_snapshot)

@@ -53,7 +53,7 @@ The following configuration directives could not be resolved and are marked as *
 
 ## Findings
 
-### CFG001-8bbc58ca0230 - Unresolved IdentityFile: /home/user/.ssh/nonexistent_key
+### CFG001-82674a9a729c - Unresolved IdentityFile: /home/user/.ssh/nonexistent_key
 
 - **Rule**: CFG001
 - **Severity**: error
@@ -66,7 +66,7 @@ The following configuration directives could not be resolved and are marked as *
   - `ls -l /home/user/.ssh/nonexistent_key`
   - `ssh -G missing-key`
 
-### ID001-1f08e1ddd077 - Duplicate public key paths or labels: SHA256:+92RsVKGXDDG2XlZkoQSG2sRjqnoPwysscnoHoCIdMk
+### ID001-95b5b9220d43 - Duplicate public key paths or labels: SHA256:+92RsVKGXDDG2XlZkoQSG2sRjqnoPwysscnoHoCIdMk
 
 - **Rule**: ID001
 - **Severity**: info
@@ -80,7 +80,7 @@ The following configuration directives could not be resolved and are marked as *
   - `Review duplicate key files and consolidate references to the canonical path`
   - `Check where this fingerprint appears with each comment and decide which comment to keep as its label`
 
-### CFG002-b331b5a88af6 - Unsupported Match directive in SSH config
+### CFG002-a15886002032 - Unsupported Match directive in SSH config
 
 - **Rule**: CFG002
 - **Severity**: info
@@ -91,7 +91,7 @@ The following configuration directives could not be resolved and are marked as *
 - **Manual remediation**:
   - `Review Match block at /home/user/.ssh/config:20 manually: ssh -G <alias>`
 
-### CFG002-246b5404abe7 - Include cycle in SSH config: /home/user/.ssh/config.d/included.conf
+### CFG002-546ce76712fa - Include cycle in SSH config: /home/user/.ssh/config.d/included.conf
 
 - **Rule**: CFG002
 - **Severity**: info
@@ -102,7 +102,7 @@ The following configuration directives could not be resolved and are marked as *
 - **Manual remediation**:
   - `Review include chain around /home/user/.ssh/config.d/cycle.conf:4`
 
-### CFG002-88ef68bf63c5 - Include cycle in SSH config: /home/user/.ssh/config.d/cycle.conf
+### CFG002-28bb51a07fac - Include cycle in SSH config: /home/user/.ssh/config.d/cycle.conf
 
 - **Rule**: CFG002
 - **Severity**: info

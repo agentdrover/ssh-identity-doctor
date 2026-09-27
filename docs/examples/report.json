@@ -14,7 +14,7 @@
           "source": "/home/user/.ssh/config"
         }
       ],
-      "id": "CFG001-8bbc58ca0230",
+      "id": "CFG001-82674a9a729c",
       "manual_remediation": [
         "ls -l /home/user/.ssh/nonexistent_key",
         "ssh -G missing-key"
@@ -42,7 +42,7 @@
           "source": "/home/user/.ssh/id_ed25519_copy.pub"
         }
       ],
-      "id": "ID001-1f08e1ddd077",
+      "id": "ID001-95b5b9220d43",
       "manual_remediation": [
         "Review duplicate key files and consolidate references to the canonical path",
         "Check where this fingerprint appears with each comment and decide which comment to keep as its label"
@@ -63,7 +63,7 @@
           "source": "/home/user/.ssh/config"
         }
       ],
-      "id": "CFG002-b331b5a88af6",
+      "id": "CFG002-a15886002032",
       "manual_remediation": [
         "Review Match block at /home/user/.ssh/config:20 manually: ssh -G <alias>"
       ],
@@ -83,7 +83,7 @@
           "source": "/home/user/.ssh/config.d/cycle.conf"
         }
       ],
-      "id": "CFG002-246b5404abe7",
+      "id": "CFG002-546ce76712fa",
       "manual_remediation": [
         "Review include chain around /home/user/.ssh/config.d/cycle.conf:4"
       ],
@@ -103,7 +103,7 @@
           "source": "/home/user/.ssh/config.d/included.conf"
         }
       ],
-      "id": "CFG002-88ef68bf63c5",
+      "id": "CFG002-28bb51a07fac",
       "manual_remediation": [
         "Review include chain around /home/user/.ssh/config.d/included.conf:5"
       ],
