@@ -1,0 +1,277 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agenthai.ru/schemas/ssh-id-doctor/scan-1.0.json",
+  "title": "ScanSnapshot",
+  "description": "JSON schema for SSH Identity Doctor ScanSnapshot version 1.0 (sdd-spec §7).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "scan_id",
+    "started_at",
+    "completed_at",
+    "platform",
+    "sources",
+    "identities",
+    "host_bindings",
+    "findings",
+    "local_references",
+    "unresolved"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "scan_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "completed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "platform": {
+      "type": "string",
+      "enum": ["macos", "linux"]
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SourceCoverage"
+      }
+    },
+    "identities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Identity"
+      }
+    },
+    "host_bindings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/HostBinding"
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Finding"
+      }
+    },
+    "local_references": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/LocalReference"
+      }
+    },
+    "unresolved": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/UnresolvedItem"
+      }
+    }
+  },
+  "$defs": {
+    "SourceCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "state", "required", "detail"],
+      "properties": {
+        "source": { "type": "string" },
+        "state": {
+          "type": "string",
+          "enum": ["available", "empty", "unavailable", "timeout", "malformed", "skipped"]
+        },
+        "required": { "type": "boolean" },
+        "detail": { "type": "string" }
+      }
+    },
+    "LocalReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "source_file", "source_line", "resolution"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["public_key", "config_identity"]
+        },
+        "path": { "type": "string" },
+        "source_file": {
+          "type": ["string", "null"]
+        },
+        "source_line": {
+          "type": ["integer", "null"]
+        },
+        "resolution": {
+          "type": "string",
+          "enum": ["resolved", "missing", "unreadable", "outside_root", "private_only"]
+        }
+      }
+    },
+    "RegistryBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["registry", "fingerprint", "title", "key_id", "created_at"],
+      "properties": {
+        "registry": { "type": "string" },
+        "fingerprint": {
+          "type": "string",
+          "pattern": "^SHA256:"
+        },
+        "title": { "type": ["string", "null"] },
+        "key_id": { "type": ["string", "null"] },
+        "created_at": { "type": ["string", "null"] }
+      }
+    },
+    "Identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fingerprint",
+        "algorithm",
+        "bits_or_curve",
+        "comments",
+        "local_references",
+        "agent_presence",
+        "registry_bindings"
+      ],
+      "properties": {
+        "fingerprint": {
+          "type": "string",
+          "pattern": "^SHA256:"
+        },
+        "algorithm": { "type": "string" },
+        "bits_or_curve": { "type": "string" },
+        "comments": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "local_references": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/LocalReference" }
+        },
+        "agent_presence": { "type": "boolean" },
+        "registry_bindings": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/RegistryBinding" }
+        }
+      }
+    },
+    "HostBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "patterns",
+        "hostname",
+        "user",
+        "identity_references",
+        "resolved_fingerprints",
+        "identities_only",
+        "source_file",
+        "source_line",
+        "confidence"
+      ],
+      "properties": {
+        "patterns": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "hostname": { "type": ["string", "null"] },
+        "user": { "type": ["string", "null"] },
+        "identity_references": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "resolved_fingerprints": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^SHA256:"
+          }
+        },
+        "identities_only": { "type": ["boolean", "null"] },
+        "source_file": { "type": "string" },
+        "source_line": { "type": "integer" },
+        "confidence": {
+          "type": "string",
+          "enum": ["certain", "heuristic", "unresolved"]
+        }
+      }
+    },
+    "EvidenceReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "line", "detail"],
+      "properties": {
+        "source": { "type": "string" },
+        "line": { "type": ["integer", "null"] },
+        "detail": { "type": "string" }
+      }
+    },
+    "Finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "rule_id",
+        "severity",
+        "confidence",
+        "title",
+        "summary",
+        "evidence",
+        "affected_fingerprints",
+        "affected_hosts",
+        "manual_remediation"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "rule_id": { "type": "string" },
+        "severity": {
+          "type": "string",
+          "enum": ["error", "warning", "info"]
+        },
+        "confidence": {
+          "type": "string",
+          "enum": ["certain", "heuristic", "unresolved"]
+        },
+        "title": { "type": "string" },
+        "summary": { "type": "string" },
+        "evidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/EvidenceReference" }
+        },
+        "affected_fingerprints": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^SHA256:"
+          }
+        },
+        "affected_hosts": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "manual_remediation": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "UnresolvedItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "detail", "source_file", "source_line"],
+      "properties": {
+        "kind": { "type": "string" },
+        "detail": { "type": "string" },
+        "source_file": { "type": "string" },
+        "source_line": { "type": ["integer", "null"] }
+      }
+    }
+  }
+}
