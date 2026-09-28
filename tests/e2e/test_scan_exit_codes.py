@@ -93,3 +93,13 @@ def test_scan_exit_codes_match_spec_5_3(
         ]
     )
     assert rc_e == ExitCode.OK
+
+    # (f) scan with nonexistent --ssh-dir -> exit 1
+    rc_f = main(
+        [
+            "scan",
+            "--ssh-dir",
+            "/nonexistent/directory/path/never/exists",
+        ]
+    )
+    assert rc_f == ExitCode.INVALID_ARGS
