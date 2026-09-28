@@ -14,9 +14,23 @@ import pytest
 from conftest import OpenGuard
 from ssh_id_doctor import process
 from ssh_id_doctor.cli import main
+from ssh_id_doctor.domain import (
+    Confidence,
+    CoverageState,
+    HostBinding,
+    Identity,
+    LocalReference,
+    LocalReferenceKind,
+    Platform,
+    Resolution,
+    ScanSnapshot,
+    SourceCoverage,
+    UnresolvedItem,
+)
 from ssh_id_doctor.exit_codes import ExitCode
 from ssh_id_doctor.inspectors.keygen import PublicKeyInspector
 from ssh_id_doctor.process import ProcessResult, ProcessStatus
+from ssh_id_doctor.rotation import build_rotation_plan, render_plan_markdown, render_plan_terminal
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures" / "home_basic"
@@ -349,9 +363,12 @@ def test_rotation_plan_end_to_end_on_real_home_basic(
     )
     assert any("agent: skipped" in u for u in unknowns)
     # Match on config:20
-    assert any("Match" in u and "config:20" in u for u in unknowns)
-    # Include cycle
-    assert any("Include" in u and "cycle" in u for u in unknowns)
+    assert any("unresolved Match directive at config:20" in u for u in unknowns), unknowns
+    # Include items of the real scan. The parser resolves the nested Include lines of
+    # config.d/*.conf against the fixture root, so it reports them as include_missing,
+    # not as a cycle -- and the plan must name them as what the parser reported.
+    for loc in ("cycle.conf:4", "included.conf:5"):
+        assert any(f"unresolved Include directive at {loc}" in u for u in unknowns), unknowns
 
     # No destructive commands
     destructive_substrings = (
@@ -456,3 +473,158 @@ def test_rotation_plan_redaction(
             for lr in data["local_references"]:
                 assert str(REPO_ROOT) not in lr["path"]
                 assert lr["path"].startswith("~/.../")
+
+
+# --- Review findings (machine review #706) -------------------------------------------------
+
+_FP_A = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+_FP_B = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+_CFG = "/h/.ssh/config"
+
+
+def _host(
+    alias: str,
+    header_line: int,
+    identity_refs: tuple[str, ...],
+    resolved: tuple[str, ...],
+    source_file: str = _CFG,
+) -> HostBinding:
+    return HostBinding(
+        patterns=(alias,),
+        hostname=None,
+        user=None,
+        identity_references=identity_refs,
+        resolved_fingerprints=resolved,
+        identities_only=None,
+        source_file=source_file,
+        source_line=header_line,
+        confidence=Confidence.CERTAIN if resolved else Confidence.UNRESOLVED,
+    )
+
+
+def _cfg_ref(path: str, line: int, source_file: str = _CFG) -> LocalReference:
+    return LocalReference(
+        kind=LocalReferenceKind.CONFIG_IDENTITY,
+        path=path,
+        source_file=source_file,
+        source_line=line,
+        resolution=Resolution.RESOLVED,
+    )
+
+
+def _snapshot(
+    *,
+    config_lines: Sequence[int] = (),
+    host_bindings: Sequence[HostBinding] = (),
+    sources: Sequence[SourceCoverage] = (),
+    unresolved: Sequence[UnresolvedItem] = (),
+) -> ScanSnapshot:
+    pub = LocalReference(
+        kind=LocalReferenceKind.PUBLIC_KEY,
+        path="/h/.ssh/id_ed25519.pub",
+        source_file=None,
+        source_line=None,
+        resolution=Resolution.RESOLVED,
+    )
+    refs = (pub, *(_cfg_ref("/h/.ssh/id_ed25519", line) for line in config_lines))
+    ident = Identity(
+        fingerprint=_FP_A,
+        algorithm="ED25519",
+        bits_or_curve="256",
+        local_references=refs,
+    )
+    return ScanSnapshot(
+        scan_id="t",
+        started_at="2026-09-28T00:00:00Z",
+        completed_at="2026-09-28T00:00:00Z",
+        platform=Platform.LINUX,
+        sources=tuple(sources),
+        identities=(ident,),
+        host_bindings=tuple(host_bindings),
+        unresolved=tuple(unresolved),
+    )
+
+
+def test_host_alias_of_other_key_with_same_basename_is_not_listed() -> None:
+    """Finding cacf9bcf1aadd1ed: stem fallback only for hosts with unresolved fingerprints."""
+    snapshot = _snapshot(
+        config_lines=(3,),
+        host_bindings=(
+            _host("good", 1, ("~/.ssh/id_ed25519",), (_FP_A,)),
+            _host("other", 5, ("/work/id_ed25519",), (_FP_B,)),
+            _host("unknown-key", 9, ("~/.ssh/id_ed25519",), ()),
+        ),
+    )
+    plan = build_rotation_plan(snapshot, _FP_A)
+    aliases = [ha.alias for ha in plan.host_aliases]
+    assert "other" not in aliases, aliases
+    assert aliases == ["good", "unknown-key"]
+
+
+def test_each_host_alias_reports_identityfile_line_of_its_own_block() -> None:
+    """Finding 271a878d0151a53a: location is the IdentityFile line of THIS Host block."""
+    # 1 Host good / 3 IdentityFile ; 5 Host also-good / 7 IdentityFile
+    snapshot = _snapshot(
+        config_lines=(3, 7),
+        host_bindings=(
+            _host("good", 1, ("~/.ssh/id_ed25519",), (_FP_A,)),
+            _host("also-good", 5, ("~/.ssh/id_ed25519",), (_FP_A,)),
+        ),
+    )
+    plan = build_rotation_plan(snapshot, _FP_A)
+    locations = {ha.alias: ha.location for ha in plan.host_aliases}
+    assert locations == {"good": "config:3", "also-good": "config:7"}
+
+
+def test_failed_agent_or_github_query_is_unknown_not_absent() -> None:
+    """Finding 80b8195962f14b75: a failed source is unknown presence, not absence."""
+    failed = (CoverageState.TIMEOUT, CoverageState.UNAVAILABLE, CoverageState.MALFORMED)
+    for state in failed:
+        snapshot = _snapshot(
+            sources=(
+                SourceCoverage(source="agent", state=state, required=False),
+                SourceCoverage(source="github", state=state, required=False),
+            )
+        )
+        plan = build_rotation_plan(snapshot, _FP_A)
+        assert plan.agent_and_github.agent_status == f"unknown ({state.value})"
+        assert plan.agent_and_github.github_status == f"unknown ({state.value})"
+        for out in (render_plan_markdown(plan), render_plan_terminal(plan)):
+            assert "not present" not in out
+            assert "none registered" not in out
+        assert f"agent: {state.value}" in plan.unknowns
+        assert f"github: {state.value}" in plan.unknowns
+
+    # A successful query that found nothing is still known absence.
+    for state in (CoverageState.AVAILABLE, CoverageState.EMPTY):
+        snapshot = _snapshot(
+            sources=(
+                SourceCoverage(source="agent", state=state, required=False),
+                SourceCoverage(source="github", state=state, required=False),
+            )
+        )
+        plan = build_rotation_plan(snapshot, _FP_A)
+        assert plan.agent_and_github.agent_status == "not present"
+        assert plan.agent_and_github.github_status == "none registered"
+
+
+def test_only_include_cycle_is_described_as_a_cycle() -> None:
+    """Finding 14c1f449843fb41f: cycle wording only for kind=include_cycle."""
+    snapshot = _snapshot(
+        unresolved=(
+            UnresolvedItem(
+                kind="include_missing", detail="nope.conf", source_file=_CFG, source_line=4
+            ),
+            UnresolvedItem(
+                kind="include_depth_exceeded", detail=_CFG, source_file=_CFG, source_line=6
+            ),
+            UnresolvedItem(kind="include_cycle", detail="a.conf", source_file=_CFG, source_line=8),
+        )
+    )
+    unknowns = build_rotation_plan(snapshot, _FP_A).unknowns
+    by_line = {line: next(u for u in unknowns if f"config:{line}" in u) for line in (4, 6, 8)}
+    assert "cycle" not in by_line[4]
+    assert "missing" in by_line[4]
+    assert "cycle" not in by_line[6]
+    assert "depth" in by_line[6]
+    assert "Include cycle" in by_line[8]

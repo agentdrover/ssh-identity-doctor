@@ -20,10 +20,14 @@ from typing import Any
 
 from ssh_id_doctor.domain import (
     CoverageState,
+    HostBinding,
+    Identity,
     LocalReference,
     LocalReferenceKind,
     RegistryBinding,
     ScanSnapshot,
+    SourceCoverage,
+    UnresolvedItem,
 )
 
 SCHEMA_VERSION = "1.0"
@@ -86,6 +90,148 @@ def _clean_stem(path: str) -> str:
     return name
 
 
+# A query that succeeded (possibly with nothing in it) is knowledge; anything else is not.
+_KNOWN_STATES = (CoverageState.AVAILABLE, CoverageState.EMPTY)
+
+
+def _agent_status(present: bool, coverage: SourceCoverage | None) -> str:
+    """FR-009 §4: known agent presence; a failed query is unknown, not absent."""
+    if present:
+        return "present"
+    if coverage is None:
+        return "unknown (not recorded)"
+    if coverage.state == CoverageState.SKIPPED:
+        return "skipped"
+    if coverage.state in _KNOWN_STATES:
+        return "not present"
+    return f"unknown ({coverage.state.value})"
+
+
+def _github_status(bindings: tuple[RegistryBinding, ...], coverage: SourceCoverage | None) -> str:
+    """FR-009 §4: known GitHub registration; a failed query is unknown, not absent."""
+    if coverage is not None and coverage.state == CoverageState.SKIPPED:
+        return "not requested"
+    if bindings:
+        return "registered"
+    if coverage is None:
+        return "unknown (not recorded)"
+    if coverage.state in _KNOWN_STATES:
+        return "none registered"
+    return f"unknown ({coverage.state.value})"
+
+
+_INCLUDE_WORDING = {
+    "include_cycle": "Include cycle",
+    "include_missing": "missing Include target",
+    "include_depth_exceeded": "Include depth exceeded",
+}
+
+
+def _describe_unresolved(item: UnresolvedItem) -> str:
+    """One Unknowns line for a CFG002 item, worded by its own kind."""
+    loc = (
+        f"{Path(item.source_file).name}:{item.source_line}"
+        if item.source_line is not None
+        else Path(item.source_file).name
+    )
+    if item.kind == "unsupported_match" or "match" in item.detail.lower():
+        return (
+            f"unresolved Match directive at {loc}: {item.detail} "
+            "(identity bindings may exist in unevaluated Match block)"
+        )
+    if item.kind.startswith("include"):
+        wording = _INCLUDE_WORDING.get(item.kind, "unparsed Include")
+        return (
+            f"unresolved Include directive at {loc} ({wording}): {item.detail} "
+            f"(identity bindings may exist in unparsed Include file)"
+        )
+    return (
+        f"unresolved directive ({item.kind}) at {loc}: {item.detail} "
+        "(identity bindings may exist in unparsed section)"
+    )
+
+
+def _host_uses_identity(hb: HostBinding, fingerprint: str, stems: set[str]) -> bool:
+    """A host uses the key when it resolves to it; name matching only when nothing resolved."""
+    if fingerprint in hb.resolved_fingerprints:
+        return True
+    if hb.resolved_fingerprints:
+        return False
+    return any(_clean_stem(ref) in stems for ref in hb.identity_references)
+
+
+def _block_end(snapshot: ScanSnapshot, hb: HostBinding) -> int | None:
+    """First line after hb's header that starts another block in the same file."""
+    starts = [
+        other.source_line
+        for other in snapshot.host_bindings
+        if other.source_file == hb.source_file and other.source_line > hb.source_line
+    ]
+    starts.extend(
+        u.source_line
+        for u in snapshot.unresolved
+        if u.kind == "unsupported_match"
+        and u.source_file == hb.source_file
+        and u.source_line is not None
+        and u.source_line > hb.source_line
+    )
+    return min(starts, default=None)
+
+
+def _identityfile_line(
+    snapshot: ScanSnapshot, hb: HostBinding, candidates: list[LocalReference]
+) -> int:
+    """Line of the IdentityFile inside hb's own block that names the key; else the header."""
+    end = _block_end(snapshot, hb)
+    own_stems = {_clean_stem(ref) for ref in hb.identity_references}
+    lines = [
+        cfg.source_line
+        for cfg in candidates
+        if cfg.source_file == hb.source_file
+        and cfg.source_line is not None
+        and cfg.source_line > hb.source_line
+        and (end is None or cfg.source_line < end)
+        and _clean_stem(cfg.path) in own_stems
+    ]
+    return min(lines, default=hb.source_line)
+
+
+def _host_aliases(snapshot: ScanSnapshot, target: Identity) -> tuple[HostAliasInfo, ...]:
+    """FR-009 §3: Host blocks that use the target key, each at its own IdentityFile line."""
+    stems = {_clean_stem(ref.path) for ref in target.local_references if ref.path}
+    own_cfg = [r for r in target.local_references if r.kind == LocalReferenceKind.CONFIG_IDENTITY]
+    unbound_cfg = [
+        r
+        for r in snapshot.local_references
+        if r.kind == LocalReferenceKind.CONFIG_IDENTITY and _clean_stem(r.path) in stems
+    ]
+
+    aliases: dict[tuple[str, str, int], HostAliasInfo] = {}
+    for hb in snapshot.host_bindings:
+        if not _host_uses_identity(hb, target.fingerprint, stems):
+            continue
+        # A resolved host is paired only with IdentityFile lines that resolved to the key.
+        candidates = own_cfg if hb.resolved_fingerprints else own_cfg + unbound_cfg
+        line = _identityfile_line(snapshot, hb, candidates)
+        alias_name = hb.patterns[0] if hb.patterns else "default"
+        key = (alias_name, hb.source_file, line)
+        aliases.setdefault(
+            key,
+            HostAliasInfo(
+                alias=alias_name,
+                patterns=hb.patterns,
+                source_file=hb.source_file,
+                source_line=line,
+                location=f"{Path(hb.source_file).name}:{line}",
+                hostname=hb.hostname,
+                user=hb.user,
+            ),
+        )
+    return tuple(
+        sorted(aliases.values(), key=lambda ha: (ha.source_file, ha.source_line, ha.alias))
+    )
+
+
 def build_rotation_plan(snapshot: ScanSnapshot, fingerprint: str) -> RotationPlan:
     """Build a RotationPlan for fingerprint from snapshot."""
     target_ident = next((i for i in snapshot.identities if i.fingerprint == fingerprint), None)
@@ -109,93 +255,16 @@ def build_rotation_plan(snapshot: ScanSnapshot, fingerprint: str) -> RotationPla
     )
 
     # 3. Host aliases
-    stems: set[str] = set()
-    ref_paths: set[str] = set()
-    for ref in target_ident.local_references:
-        if ref.path:
-            ref_paths.add(ref.path)
-            stems.add(_clean_stem(ref.path))
-
-    cfg_refs_in_ident = [
-        r for r in target_ident.local_references if r.kind == LocalReferenceKind.CONFIG_IDENTITY
-    ]
-    cfg_refs_in_unbound = [
-        r
-        for r in snapshot.local_references
-        if r.kind == LocalReferenceKind.CONFIG_IDENTITY
-        and (_clean_stem(r.path) in stems or r.path in ref_paths)
-    ]
-    all_matching_cfg = cfg_refs_in_ident + cfg_refs_in_unbound
-
-    matching_host_aliases: list[HostAliasInfo] = []
-    seen_aliases: set[tuple[str, str, int]] = set()
-
-    for hb in snapshot.host_bindings:
-        matched = False
-        if fingerprint in hb.resolved_fingerprints:
-            matched = True
-        if not matched:
-            for id_ref in hb.identity_references:
-                if _clean_stem(id_ref) in stems or id_ref in ref_paths:
-                    matched = True
-                    break
-
-        if matched:
-            line = hb.source_line
-            for cfg in all_matching_cfg:
-                if cfg.source_file == hb.source_file and cfg.source_line is not None:
-                    cfg_stem = _clean_stem(cfg.path)
-                    if cfg_stem in stems or any(
-                        _clean_stem(ir) == cfg_stem or Path(ir).name == Path(cfg.path).name
-                        for ir in hb.identity_references
-                    ):
-                        line = cfg.source_line
-                        break
-
-            alias_name = hb.patterns[0] if hb.patterns else "default"
-            loc = f"{Path(hb.source_file).name}:{line}"
-            alias_key = (alias_name, hb.source_file, line)
-            if alias_key not in seen_aliases:
-                seen_aliases.add(alias_key)
-                matching_host_aliases.append(
-                    HostAliasInfo(
-                        alias=alias_name,
-                        patterns=hb.patterns,
-                        source_file=hb.source_file,
-                        source_line=line,
-                        location=loc,
-                        hostname=hb.hostname,
-                        user=hb.user,
-                    )
-                )
-
-    matching_host_aliases.sort(key=lambda ha: (ha.source_file, ha.source_line, ha.alias))
+    matching_host_aliases = _host_aliases(snapshot, target_ident)
 
     # 4. Agent and GitHub
     agent_cov = next((s for s in snapshot.sources if s.source == "agent"), None)
     github_cov = next((s for s in snapshot.sources if s.source == "github"), None)
-
-    agent_present = target_ident.agent_presence
-    if agent_present:
-        agent_status = "present"
-    elif agent_cov is not None and agent_cov.state == CoverageState.SKIPPED:
-        agent_status = "skipped"
-    else:
-        agent_status = "not present"
-
-    github_bindings = target_ident.registry_bindings
-    if github_cov is not None and github_cov.state == CoverageState.SKIPPED:
-        github_status = "not requested"
-    elif github_bindings:
-        github_status = "registered"
-    else:
-        github_status = "none registered"
-
     agent_and_github = AgentAndGitHubInfo(
-        agent_presence=agent_present,
-        agent_status=agent_status,
-        github_status=github_status,
-        github_bindings=github_bindings,
+        agent_presence=target_ident.agent_presence,
+        agent_status=_agent_status(target_ident.agent_presence, agent_cov),
+        github_status=_github_status(target_ident.registry_bindings, github_cov),
+        github_bindings=target_ident.registry_bindings,
     )
 
     # 5. Unknowns
@@ -214,27 +283,7 @@ def build_rotation_plan(snapshot: ScanSnapshot, fingerprint: str) -> RotationPla
         else:
             unknowns_list.append(f"github: {github_cov.state.value}")
 
-    for u in snapshot.unresolved:
-        loc = (
-            f"{Path(u.source_file).name}:{u.source_line}"
-            if u.source_line is not None
-            else Path(u.source_file).name
-        )
-        if u.kind == "unsupported_match" or "match" in u.detail.lower():
-            unknowns_list.append(
-                f"unresolved Match directive at {loc}: {u.detail} "
-                "(identity bindings may exist in unevaluated Match block)"
-            )
-        elif "cycle" in u.detail.lower() or "include" in u.kind.lower():
-            unknowns_list.append(
-                f"unresolved Include directive at {loc}: {u.detail} "
-                "(identity bindings may exist in unparsed Include cycle)"
-            )
-        else:
-            unknowns_list.append(
-                f"unresolved directive ({u.kind}) at {loc}: {u.detail} "
-                "(identity bindings may exist in unparsed section)"
-            )
+    unknowns_list.extend(_describe_unresolved(u) for u in snapshot.unresolved)
 
     # 6. Backup access
     backup_access_msg = (
@@ -264,7 +313,7 @@ def build_rotation_plan(snapshot: ScanSnapshot, fingerprint: str) -> RotationPla
         fingerprint=fingerprint,
         identity=identity_meta,
         local_references=sorted_local_refs,
-        host_aliases=tuple(matching_host_aliases),
+        host_aliases=matching_host_aliases,
         agent_and_github=agent_and_github,
         unknowns=tuple(unknowns_list),
         backup_access=backup_access_msg,
