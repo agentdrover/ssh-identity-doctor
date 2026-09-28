@@ -159,6 +159,7 @@ def test_every_rule_has_description_without_unsafe_wording() -> None:
     When test iterates over rule description registry in explain.py.
     Then each of CFG001, CFG002, ID001, ID002, LAB001, AGT001, AGT002, ALG001, REG001
     has non-empty description; none contains 'unused' and 'safe to delete'.
+    Also ALG001 does not misleadingly cite ECDSA-256 as an example since it is not flagged.
     """
     required_rules = [
         "CFG001",
@@ -181,6 +182,11 @@ def test_every_rule_has_description_without_unsafe_wording() -> None:
         assert "safe to delete" not in desc.lower(), (
             f"Rule {rule_id} description contains 'safe to delete'"
         )
+
+    # Review finding 5266a94545452130: ALG001 must not cite ECDSA-256
+    assert "ecdsa" not in RULE_DESCRIPTIONS["ALG001"].lower(), (
+        "ALG001 cites ECDSA even though the rule does not flag it"
+    )
 
 
 def test_explain_json_and_markdown_formats(

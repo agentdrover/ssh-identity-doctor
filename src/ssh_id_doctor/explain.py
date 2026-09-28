@@ -67,7 +67,7 @@ RULE_DESCRIPTIONS: dict[str, str] = {
     ),
     "ALG001": (
         "A public key uses a legacy or weak cryptographic algorithm "
-        "(such as DSA, ECDSA-256, or short RSA keys)."
+        "(such as DSA or short RSA keys)."
     ),
     "REG001": (
         "A key registered in a remote registry (such as GitHub) has no matching "
