@@ -1,18 +1,19 @@
-"""SEC-004 / SEC-005 / SEC-006: static boundaries AST checks (AC-1, AC-2).
+"""SEC-004 / SEC-005 / SEC-006: static boundaries of src/ssh_id_doctor (AC-1, AC-2).
 
-Enforces:
-1. No network module imports across src/ssh_id_doctor/**/*.py.
-2. No filesystem mutation operations across src/ssh_id_doctor/**/*.py, except
-   the explicitly documented exceptions in output.py (SEC-003 safe atomic report writing).
-3. All literal argv with "gh" as first element:
-   - after "api", must have "--method" "GET";
-   - no "-X", "POST", "PUT", "PATCH", "DELETE", "ssh-key", "auth" (except "auth status"),
-     "-f", "--field", "--input".
+AST of every src/ssh_id_doctor/**/*.py (comments and docstrings do not count):
+1. No network module imports (socket, ssl, urllib, http, requests, httpx, ...).
+2. No filesystem mutations (os.remove/unlink/rmdir/chmod/fchmod/chown/fchown/...,
+   shutil.rmtree/move, .unlink()/.rmdir()/.chmod()/.rename()/.touch()) except an
+   explicit list keyed by the exact triple (file, enclosing function, call).
+3. Every literal argv starting with "gh" is read-only: "api" is followed by
+   "--method" "GET"; no -X, POST/PUT/PATCH/DELETE, ssh-key, auth other than
+   "auth status", -f/-F/--field/--raw-field/--input.
 """
 
 from __future__ import annotations
 
 import ast
+import itertools
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,7 +40,9 @@ FORBIDDEN_NETWORK_MODULES: frozenset[str] = frozenset(
     }
 )
 
-# Filesystem mutating functions and methods forbidden in src/ (SEC-006)
+# Filesystem mutating functions and methods forbidden in src/ (SEC-006).
+# fchmod/fchown/lchmod/lchown count as mutations on a par with chmod/chown
+# (owner answer on #1450); replace/renames are renames.
 FORBIDDEN_OS_FUNCS: frozenset[str] = frozenset(
     {
         "remove",
@@ -47,9 +50,15 @@ FORBIDDEN_OS_FUNCS: frozenset[str] = frozenset(
         "rmdir",
         "removedirs",
         "chmod",
+        "fchmod",
+        "lchmod",
         "chown",
+        "fchown",
+        "lchown",
         "utime",
         "rename",
+        "renames",
+        "replace",
     }
 )
 FORBIDDEN_SHUTIL_FUNCS: frozenset[str] = frozenset(
@@ -58,49 +67,68 @@ FORBIDDEN_SHUTIL_FUNCS: frozenset[str] = frozenset(
         "move",
     }
 )
+# Method calls on path-like objects. ``.replace()`` is deliberately absent:
+# ``str.replace`` is everywhere in src and cannot be told apart statically.
 FORBIDDEN_PATH_METHODS: frozenset[str] = frozenset(
     {
         "unlink",
         "rmdir",
         "chmod",
+        "lchmod",
         "rename",
         "touch",
     }
 )
+_FORBIDDEN_BY_MODULE: dict[str, frozenset[str]] = {
+    "os": FORBIDDEN_OS_FUNCS,
+    "shutil": FORBIDDEN_SHUTIL_FUNCS,
+}
 
 
 class FsException(NamedTuple):
-    filename: str
-    operation: str
+    """One permitted mutation: exactly (file, enclosing function, call).
+
+    ``file`` is relative to src/ssh_id_doctor. A whole file is never exempt:
+    the same call in any other function of that file is still a violation.
+    """
+
+    file: str
+    function: str
+    call: str
     reason: str
 
 
-# Explicit whitelist of permitted FS mutation operations: file + operation + reason
+# Explicit list of permitted FS mutations — only what exists on main.
 FS_MUTATION_EXCEPTIONS: tuple[FsException, ...] = (
     FsException(
-        filename="output.py",
-        operation="os.fchmod",
-        reason="SEC-003: report file must be owner read/write only (0600) upon creation",
+        file="output.py",
+        function="write_report_atomically",
+        call="os.fchmod",
+        reason="SEC-003: --output report temp file is set to owner-only 0600 on creation",
     ),
     FsException(
-        filename="output.py",
-        operation="os.replace",
-        reason="SEC-003: report file is written to temporary path and atomically replaced",
+        file="output.py",
+        function="write_report_atomically",
+        call="os.replace",
+        reason="SEC-003: --output report is written to a temp file and atomically replaced",
     ),
     FsException(
-        filename="output.py",
-        operation="os.unlink",
-        reason="SEC-003: clean up temporary report file if writing/replacing fails",
+        file="output.py",
+        function="write_report_atomically",
+        call="os.unlink",
+        reason="SEC-003: the report's own temp file is removed when writing/replacing fails",
     ),
     FsException(
-        filename="keygen.py",
-        operation="os.fchmod",
-        reason="FR-003 / SEC-001: temporary scratch file for ssh-keygen -l must be mode 0600",
+        file="inspectors/keygen.py",
+        function="_write_scratch_pub",
+        call="os.fchmod",
+        reason="scratch .pub from tempfile.mkstemp (inspector's own file) is set to 0600",
     ),
     FsException(
-        filename="keygen.py",
-        operation="os.unlink",
-        reason="FR-003 / SEC-001: temporary scratch file for ssh-keygen -l cleaned up",
+        file="inspectors/keygen.py",
+        function="_remove_scratch",
+        call="os.unlink",
+        reason="scratch .pub from tempfile.mkstemp (inspector's own file) is removed",
     ),
 )
 
@@ -113,341 +141,389 @@ class Violation:
     detail: str
 
 
-def _get_call_name(node: ast.Call) -> tuple[str | None, str]:
-    """Return (base_obj, method_or_func_name) for a call node."""
+def _is_network_module(name: str) -> bool:
+    return name.split(".")[0] in FORBIDDEN_NETWORK_MODULES
+
+
+def _dynamic_import_target(node: ast.Call) -> str | None:
+    """Literal module name of ``__import__("x")`` / ``importlib.import_module("x")``."""
     func = node.func
-    if isinstance(func, ast.Name):
-        return None, func.id
-    if isinstance(func, ast.Attribute):
-        if isinstance(func.value, ast.Name):
-            return func.value.id, func.attr
-        if isinstance(func.value, ast.Attribute) and isinstance(func.value.value, ast.Name):
-            return f"{func.value.value.id}.{func.value.attr}", func.attr
-        return "__expr__", func.attr
-    return None, ""
+    is_dunder = isinstance(func, ast.Name) and func.id == "__import__"
+    is_importlib = isinstance(func, ast.Attribute) and func.attr == "import_module"
+    if not (is_dunder or is_importlib) or not node.args:
+        return None
+    first = node.args[0]
+    if isinstance(first, ast.Constant) and isinstance(first.value, str):
+        return first.value
+    return None
+
+
+def _imported_modules(node: ast.AST) -> list[str]:
+    if isinstance(node, ast.Import):
+        return [alias.name for alias in node.names]
+    if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+        return [node.module]
+    if isinstance(node, ast.Call):
+        target = _dynamic_import_target(node)
+        return [target] if target else []
+    return []
 
 
 def find_network_violations(source_code: str, filename: str) -> list[Violation]:
-    """Find imports of network modules."""
-    violations: list[Violation] = []
+    """Imports (static or literal dynamic) of network modules (SEC-004)."""
     tree = ast.parse(source_code, filename=filename)
+    return [
+        Violation(
+            file=filename,
+            line=getattr(node, "lineno", 1),
+            rule="SEC-004",
+            detail=f"forbidden network import: {name}",
+        )
+        for node in ast.walk(tree)
+        for name in _imported_modules(node)
+        if _is_network_module(name)
+    ]
 
+
+@dataclass(frozen=True, slots=True)
+class FsCall:
+    """A mutating filesystem call found in source, with its enclosing function."""
+
+    line: int
+    function: str
+    call: str
+
+
+def _module_aliases(tree: ast.AST) -> tuple[dict[str, str], dict[str, str]]:
+    """Map local names to modules (``import os as o``) and functions (``from os import rm``)."""
+    modules: dict[str, str] = {}
+    functions: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                top_pkg = alias.name.split(".")[0]
-                if top_pkg in FORBIDDEN_NETWORK_MODULES:
-                    violations.append(
-                        Violation(
-                            file=filename,
-                            line=node.lineno,
-                            rule="SEC-004",
-                            detail=f"forbidden network import: {alias.name}",
-                        )
-                    )
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                top_pkg = node.module.split(".")[0]
-                if top_pkg in FORBIDDEN_NETWORK_MODULES:
-                    violations.append(
-                        Violation(
-                            file=filename,
-                            line=node.lineno,
-                            rule="SEC-004",
-                            detail=f"forbidden network import: {node.module}",
-                        )
-                    )
-    return violations
+                if alias.name in _FORBIDDEN_BY_MODULE:
+                    modules[alias.asname or alias.name] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.level == 0:
+            forbidden = _FORBIDDEN_BY_MODULE.get(node.module or "")
+            if forbidden is None:
+                continue
+            for alias in node.names:
+                if alias.name in forbidden:
+                    functions[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    return modules, functions
+
+
+def _classify_call(
+    node: ast.Call, modules: dict[str, str], functions: dict[str, str]
+) -> str | None:
+    """Return the canonical mutating operation a call performs, or None."""
+    func = node.func
+    if isinstance(func, ast.Name):
+        return functions.get(func.id)
+    if not isinstance(func, ast.Attribute):
+        return None
+    if isinstance(func.value, ast.Name) and func.value.id in modules:
+        module = modules[func.value.id]
+        if func.attr in _FORBIDDEN_BY_MODULE[module]:
+            return f"{module}.{func.attr}"
+        return None
+    if func.attr in FORBIDDEN_PATH_METHODS:
+        return f".{func.attr}()"
+    return None
+
+
+class _FsCallCollector(ast.NodeVisitor):
+    def __init__(self, modules: dict[str, str], functions: dict[str, str]) -> None:
+        self._modules = modules
+        self._functions = functions
+        self._scope: list[str] = []
+        self.calls: list[FsCall] = []
+
+    def _visit_scope(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> None:
+        self._scope.append(node.name)
+        self.generic_visit(node)
+        self._scope.pop()
+
+    visit_FunctionDef = _visit_scope
+    visit_AsyncFunctionDef = _visit_scope
+    visit_ClassDef = _visit_scope
+
+    def visit_Call(self, node: ast.Call) -> None:
+        op = _classify_call(node, self._modules, self._functions)
+        if op is not None:
+            where = ".".join(self._scope) or "<module>"
+            self.calls.append(FsCall(line=node.lineno, function=where, call=op))
+        self.generic_visit(node)
+
+
+def collect_fs_mutations(source_code: str, filename: str) -> list[FsCall]:
+    """Every mutating filesystem call in the source, with its enclosing function."""
+    tree = ast.parse(source_code, filename=filename)
+    collector = _FsCallCollector(*_module_aliases(tree))
+    collector.visit(tree)
+    return collector.calls
 
 
 def find_fs_mutation_violations(
     source_code: str,
     filename: str,
     allowed_exceptions: Iterable[FsException] = (),
+    rel_file: str | None = None,
 ) -> list[Violation]:
-    """Find destructive/mutating filesystem calls."""
-    violations: list[Violation] = []
-    tree = ast.parse(source_code, filename=filename)
-    base_filename = Path(filename).name
-
-    exceptions_map: dict[str, set[str]] = {}
-    for exc in allowed_exceptions:
-        exceptions_map.setdefault(exc.filename, set()).add(exc.operation)
-
-    allowed_ops = exceptions_map.get(base_filename, set())
-
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-
-        base_obj, func_name = _get_call_name(node)
-
-        # 1. os.<func> calls
-        if base_obj == "os" and func_name in (FORBIDDEN_OS_FUNCS | {"fchmod", "replace"}):
-            full_op = f"os.{func_name}"
-            if full_op not in allowed_ops:
-                violations.append(
-                    Violation(
-                        file=filename,
-                        line=node.lineno,
-                        rule="SEC-006",
-                        detail=f"forbidden filesystem call: {full_op}",
-                    )
-                )
-
-        # 2. Directly imported os/shutil functions, e.g. remove(...) or rmtree(...)
-        elif base_obj is None and func_name in (
-            FORBIDDEN_OS_FUNCS | FORBIDDEN_SHUTIL_FUNCS | {"fchmod", "replace"}
-        ):
-            full_op = f"os.{func_name}"
-            shutil_op = f"shutil.{func_name}"
-            if full_op not in allowed_ops and shutil_op not in allowed_ops:
-                violations.append(
-                    Violation(
-                        file=filename,
-                        line=node.lineno,
-                        rule="SEC-006",
-                        detail=f"forbidden filesystem call: {func_name}",
-                    )
-                )
-
-        # 3. shutil.<func> calls
-        elif base_obj == "shutil" and func_name in FORBIDDEN_SHUTIL_FUNCS:
-            full_op = f"shutil.{func_name}"
-            if full_op not in allowed_ops:
-                violations.append(
-                    Violation(
-                        file=filename,
-                        line=node.lineno,
-                        rule="SEC-006",
-                        detail=f"forbidden filesystem call: {full_op}",
-                    )
-                )
-
-        # 4. Method calls on paths/objects (.unlink(), .rmdir(), .chmod(), .rename(), .touch())
-        elif func_name in FORBIDDEN_PATH_METHODS:
-            method_op = f".{func_name}()"
-            if method_op not in allowed_ops and func_name not in allowed_ops:
-                violations.append(
-                    Violation(
-                        file=filename,
-                        line=node.lineno,
-                        rule="SEC-006",
-                        detail=f"forbidden path method: .{func_name}()",
-                    )
-                )
-
-    return violations
+    """Mutating FS calls not covered by an exact (file, function, call) exception."""
+    key_file = rel_file if rel_file is not None else Path(filename).name
+    allowed = {(e.file, e.function, e.call) for e in allowed_exceptions}
+    return [
+        Violation(
+            file=filename,
+            line=c.line,
+            rule="SEC-006",
+            detail=f"forbidden filesystem call: {c.call} in {c.function}()",
+        )
+        for c in collect_fs_mutations(source_code, filename)
+        if (key_file, c.function, c.call) not in allowed
+    ]
 
 
-def _extract_string_literals(node: ast.AST) -> list[str] | None:
-    """Extract list of constant string elements from a list or tuple AST node."""
-    if not isinstance(node, (ast.List, ast.Tuple)):
+_GH_FORBIDDEN_TOKENS: frozenset[str] = frozenset(
+    {"-X", "POST", "PUT", "PATCH", "DELETE", "-f", "-F", "--field", "--raw-field", "--input"}
+)
+# ``--method=POST`` / ``-XPOST`` / ``--field=a=b`` spellings of the same flags.
+_GH_FORBIDDEN_PREFIXES: tuple[str, ...] = (
+    "-X",
+    "--method=",
+    "--field=",
+    "--raw-field=",
+    "--input=",
+)
+
+
+def _gh_argv(node: ast.AST) -> list[str | None] | None:
+    """Elements of a list/tuple literal whose first element is the literal "gh".
+
+    Non-literal elements come back as None so the caller can refuse them.
+    """
+    if not isinstance(node, (ast.List, ast.Tuple)) or not node.elts:
         return None
-    elements: list[str] = []
-    for elt in node.elts:
-        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-            elements.append(elt.value)
-        else:
-            return None
-    return elements
+    first = node.elts[0]
+    if not (isinstance(first, ast.Constant) and first.value == "gh"):
+        return None
+    return [
+        elt.value if isinstance(elt, ast.Constant) and isinstance(elt.value, str) else None
+        for elt in node.elts
+    ]
+
+
+def _gh_problems(argv: list[str | None]) -> list[str]:
+    elements = [e for e in argv if e is not None]
+    if len(elements) != len(argv):
+        return [f"non-literal element in gh argv: {argv}"]
+    problems: list[str] = []
+    forbidden = [
+        t
+        for t in elements
+        if t in _GH_FORBIDDEN_TOKENS
+        or (t.startswith(_GH_FORBIDDEN_PREFIXES) and t != "--method=GET")
+    ]
+    if forbidden:
+        problems.append(f"forbidden tokens in gh argv: {forbidden}")
+    if "ssh-key" in elements:
+        problems.append("forbidden gh subcommand: ssh-key")
+    if "auth" in elements and elements[elements.index("auth") + 1 :][:1] != ["status"]:
+        problems.append(f"forbidden gh auth command (not 'auth status'): {elements}")
+    if "api" in elements:
+        tail = elements[elements.index("api") + 1 :]
+        has_get = "--method=GET" in tail or any(
+            a == "--method" and b == "GET" for a, b in itertools.pairwise(tail)
+        )
+        if not has_get:
+            problems.append(f"gh api invocation without '--method GET': {elements}")
+    return problems
 
 
 def find_gh_argv_violations(source_code: str, filename: str) -> list[Violation]:
-    """Find literal argv lists where first element is "gh" and enforce read-only GET constraints."""
-    violations: list[Violation] = []
+    """Literal argv starting with "gh" must be read-only (SEC-005, §13.4)."""
     tree = ast.parse(source_code, filename=filename)
-
+    violations: list[Violation] = []
     for node in ast.walk(tree):
-        elements = _extract_string_literals(node)
-        if elements is None or not elements:
+        argv = _gh_argv(node)
+        if argv is None:
             continue
-
-        if elements[0] != "gh":
-            continue
-
-        lineno = getattr(node, "lineno", 1)
-
-        # Forbidden tokens in any position of gh argv
-        forbidden_tokens = {"-X", "POST", "PUT", "PATCH", "DELETE", "-f", "--field", "--input"}
-        found_forbidden = [t for t in elements if t in forbidden_tokens]
-        if found_forbidden:
-            violations.append(
-                Violation(
-                    file=filename,
-                    line=lineno,
-                    rule="SEC-005/006",
-                    detail=f"forbidden tokens in gh argv: {found_forbidden}",
-                )
-            )
-
-        # Subcommand "ssh-key" forbidden
-        if "ssh-key" in elements:
-            violations.append(
-                Violation(
-                    file=filename,
-                    line=lineno,
-                    rule="SEC-006",
-                    detail="forbidden gh subcommand: ssh-key",
-                )
-            )
-
-        # Subcommand "auth": only "auth status" permitted
-        if "auth" in elements:
-            idx = elements.index("auth")
-            if idx + 1 >= len(elements) or elements[idx + 1] != "status":
-                violations.append(
-                    Violation(
-                        file=filename,
-                        line=lineno,
-                        rule="SEC-005",
-                        detail=f"forbidden gh auth command (not 'auth status'): {elements}",
-                    )
-                )
-
-        # If "api" is invoked, after "api" there must be "--method" "GET"
-        if "api" in elements:
-            api_idx = elements.index("api")
-            tail = elements[api_idx + 1 :]
-            has_method_get = False
-            for i in range(len(tail) - 1):
-                if tail[i] == "--method" and tail[i + 1] == "GET":
-                    has_method_get = True
-                    break
-            if not has_method_get:
-                violations.append(
-                    Violation(
-                        file=filename,
-                        line=lineno,
-                        rule="SEC-005",
-                        detail=f"gh api invocation without '--method GET': {elements}",
-                    )
-                )
-
+        line = getattr(node, "lineno", 1)
+        violations.extend(
+            Violation(file=filename, line=line, rule="SEC-005", detail=problem)
+            for problem in _gh_problems(argv)
+        )
     return violations
 
 
-def test_fs_exceptions_reference_existing_files() -> None:
-    """Every entry in FS_MUTATION_EXCEPTIONS must reference a file that actually exists in src."""
+def _src_files() -> list[Path]:
+    return sorted(SRC_ROOT.rglob("*.py"))
+
+
+def _display(py_file: Path) -> str:
+    return str(py_file.relative_to(SRC_ROOT.parents[1]))
+
+
+def _rel(py_file: Path) -> str:
+    return py_file.relative_to(SRC_ROOT).as_posix()
+
+
+def validate_fs_exceptions(exceptions: Iterable[FsException], src_root: Path = SRC_ROOT) -> None:
+    """Each exception names an existing file, a reason, and a call that is really there.
+
+    An exception whose file, function or call is absent is stale and fails: the
+    list may only name what exists, never carry dead permissions.
+    """
+    for exc in exceptions:
+        path = src_root / exc.file
+        if not path.is_file():
+            raise AssertionError(f"exception references non-existent file {exc.file}")
+        if not exc.reason.strip():
+            raise AssertionError(f"exception {exc.file}::{exc.function} has no reason")
+        found = {
+            (c.function, c.call)
+            for c in collect_fs_mutations(path.read_text(encoding="utf-8"), str(path))
+        }
+        if (exc.function, exc.call) not in found:
+            raise AssertionError(
+                f"exception {exc.file}::{exc.function} -> {exc.call} matches no call in src"
+            )
+
+
+def test_fs_exceptions_reference_existing_calls() -> None:
+    """Every (file, function, call) exception points at a call that exists in src."""
     validate_fs_exceptions(FS_MUTATION_EXCEPTIONS)
 
 
-def validate_fs_exceptions(exceptions: Iterable[FsException]) -> None:
-    """Validate that every exception references an existing file with operation and reason."""
-    for exc in exceptions:
-        matches = list(SRC_ROOT.rglob(exc.filename))
-        if len(matches) != 1 or not matches[0].is_file():
-            raise AssertionError(f"Exception references non-existent file {exc.filename}")
-        if not exc.operation:
-            raise AssertionError("Exception must specify operation")
-        if not exc.reason:
-            raise AssertionError("Exception must specify reason")
-
-
 def test_src_imports_no_network_modules() -> None:
-    """AC-1: No module in src/ imports forbidden network modules (SEC-004)."""
-    all_violations: list[Violation] = []
-    for py_file in sorted(SRC_ROOT.rglob("*.py")):
-        source = py_file.read_text(encoding="utf-8")
-        rel_path = str(py_file.relative_to(SRC_ROOT.parents[1]))
-        all_violations.extend(find_network_violations(source, rel_path))
-
-    assert all_violations == [], (
-        f"Network module imports detected in src: {[v.detail for v in all_violations]}"
-    )
+    """AC-1: No module in src/ imports a network module (SEC-004)."""
+    violations = [
+        v
+        for f in _src_files()
+        for v in find_network_violations(f.read_text(encoding="utf-8"), _display(f))
+    ]
+    assert violations == [], f"Network module imports detected in src: {violations}"
 
 
 def test_src_has_no_unapproved_fs_mutations() -> None:
-    """AC-1: No module in src/ performs FS mutations outside exceptions list (SEC-006)."""
-    all_violations: list[Violation] = []
-    for py_file in sorted(SRC_ROOT.rglob("*.py")):
-        source = py_file.read_text(encoding="utf-8")
-        rel_path = str(py_file.relative_to(SRC_ROOT.parents[1]))
-        all_violations.extend(
-            find_fs_mutation_violations(source, rel_path, allowed_exceptions=FS_MUTATION_EXCEPTIONS)
+    """AC-1: No FS mutation in src/ outside the (file, function, call) exceptions (SEC-006)."""
+    violations = [
+        v
+        for f in _src_files()
+        for v in find_fs_mutation_violations(
+            f.read_text(encoding="utf-8"),
+            _display(f),
+            allowed_exceptions=FS_MUTATION_EXCEPTIONS,
+            rel_file=_rel(f),
         )
-
-    assert all_violations == [], (
-        f"Filesystem mutations detected in src: {[v.detail for v in all_violations]}"
-    )
+    ]
+    assert violations == [], f"Filesystem mutations detected in src: {violations}"
 
 
 def test_src_gh_argv_read_only() -> None:
-    """AC-1: All literal gh argv in src/ are read-only (SEC-005/SEC-006)."""
-    all_violations: list[Violation] = []
-    for py_file in sorted(SRC_ROOT.rglob("*.py")):
-        source = py_file.read_text(encoding="utf-8")
-        rel_path = str(py_file.relative_to(SRC_ROOT.parents[1]))
-        all_violations.extend(find_gh_argv_violations(source, rel_path))
-
-    assert all_violations == [], (
-        f"Mutating gh invocations detected in src: {[v.detail for v in all_violations]}"
-    )
+    """AC-1: All literal gh argv in src/ are read-only (SEC-005, §13.4)."""
+    violations = [
+        v
+        for f in _src_files()
+        for v in find_gh_argv_violations(f.read_text(encoding="utf-8"), _display(f))
+    ]
+    assert violations == [], f"Mutating gh invocations detected in src: {violations}"
 
 
-def test_checkers_catch_synthetic_violations(tmp_path: Path) -> None:
-    """AC-2: Checkers catch violations in synthetic source files and report file and line."""
-    synthetic_code = """
+_SYNTHETIC = """
 import socket
 from urllib.request import urlopen
 import os
 import shutil
 from pathlib import Path
+from os import remove as rm
 
 def mutate(p):
     os.remove(p)
     os.unlink(p)
     os.rmdir(p)
     os.chmod(p, 0o777)
+    os.fchmod(3, 0o777)
+    os.fchown(3, 0, 0)
     shutil.rmtree(p)
     Path(p).unlink()
     Path(p).chmod(0o600)
+    rm(p)
     cmd1 = ["gh", "api", "-X", "POST", "user/keys"]
     cmd2 = ["gh", "ssh-key", "add", "key.pub"]
     cmd3 = ["gh", "auth", "token"]
     cmd4 = ["gh", "api", "--paginate", "user/keys"]
     cmd5 = ["gh", "api", "--field", "title=foo", "user/keys"]
+    cmd6 = ["gh", "api", "--method=POST", "user/keys"]
 """
+
+_COMMENTS_ONLY = "# import socket\n'''from urllib import request'''\n"
+
+
+def test_checkers_catch_synthetic_violations(tmp_path: Path) -> None:
+    """AC-2: each checker reports file and line on a synthetic source; stale exception fails."""
     synth_file = tmp_path / "synthetic_bad.py"
-    synth_file.write_text(synthetic_code, encoding="utf-8")
+    synth_file.write_text(_SYNTHETIC, encoding="utf-8")
     content = synth_file.read_text(encoding="utf-8")
-    filename = synth_file.name
+    name = synth_file.name
+    lines = content.splitlines()
 
-    # 1. Network checks
-    net_viols = find_network_violations(content, filename)
-    assert len(net_viols) >= 2
-    assert any(v.file == filename and v.line == 2 and "socket" in v.detail for v in net_viols)
-    assert any(v.file == filename and v.line == 3 and "urllib" in v.detail for v in net_viols)
+    def line_of(fragment: str) -> int:
+        return next(i for i, text in enumerate(lines, start=1) if fragment in text)
 
-    # Comments and docstrings must not count
-    comment_only_code = "# import socket\n'''from urllib import request'''\n"
-    assert find_network_violations(comment_only_code, "test.py") == []
+    # 1. Network: import socket / urllib, each at its own line; comments do not count.
+    net = {(v.file, v.line) for v in find_network_violations(content, name)}
+    assert (name, line_of("import socket")) in net
+    assert (name, line_of("from urllib")) in net
+    assert find_network_violations(_COMMENTS_ONLY, "c.py") == []
 
-    # 2. FS mutation checks
-    fs_viols = find_fs_mutation_violations(content, filename)
-    assert len(fs_viols) >= 7
-    assert any(v.file == filename and "os.remove" in v.detail for v in fs_viols)
-    assert any(v.file == filename and "os.unlink" in v.detail for v in fs_viols)
-    assert any(v.file == filename and "os.rmdir" in v.detail for v in fs_viols)
-    assert any(v.file == filename and "os.chmod" in v.detail for v in fs_viols)
-    assert any(v.file == filename and "shutil.rmtree" in v.detail for v in fs_viols)
-    assert any(v.file == filename and ".unlink()" in v.detail for v in fs_viols)
-    assert any(v.file == filename and ".chmod()" in v.detail for v in fs_viols)
+    # 2. FS mutations: every forbidden spelling is found at its own line.
+    fs = {(v.file, v.line) for v in find_fs_mutation_violations(content, name)}
+    for fragment in (
+        "os.remove(p)",
+        "os.unlink(p)",
+        "os.rmdir(p)",
+        "os.chmod(p",
+        "os.fchmod(3",
+        "os.fchown(3",
+        "shutil.rmtree(p)",
+        "Path(p).unlink()",
+        "Path(p).chmod(",
+        "rm(p)",
+    ):
+        assert (name, line_of(fragment)) in fs, fragment
 
-    # 3. Exception for non-existent file must fail validation
-    fake_exc = FsException(
-        filename="nonexistent_module.py",
-        operation="os.remove",
-        reason="Testing non-existent exception file rejection",
-    )
+    # 3. An exception for a file that does not exist is itself a failure.
+    ghost = FsException("nonexistent_module.py", "f", "os.remove", "stale")
     with pytest.raises(AssertionError, match="non-existent file"):
-        validate_fs_exceptions([fake_exc])
+        validate_fs_exceptions([ghost])
 
-    # 4. GH argv checks
-    gh_viols = find_gh_argv_violations(content, filename)
-    assert len(gh_viols) >= 5
-    assert any((v.file == filename and "-X" in v.detail) or "POST" in v.detail for v in gh_viols)
-    assert any(v.file == filename and "ssh-key" in v.detail for v in gh_viols)
-    assert any(v.file == filename and "auth" in v.detail for v in gh_viols)
-    assert any(v.file == filename and "--method GET" in v.detail for v in gh_viols)
-    assert any(v.file == filename and "--field" in v.detail for v in gh_viols)
+    # 4. gh argv: -X POST, ssh-key, auth token, api without GET, --field, --method=POST.
+    gh = find_gh_argv_violations(content, name)
+    assert all(v.file == name for v in gh)
+    gh_lines = {v.line for v in gh}
+    for n in range(1, 7):
+        assert line_of(f"cmd{n} =") in gh_lines, f"cmd{n}"
+
+
+def test_fs_exception_is_scoped_to_function_and_call() -> None:
+    """The keygen.py exceptions cover one function and one call each, not the whole file."""
+    source = (SRC_ROOT / "inspectors" / "keygen.py").read_text(encoding="utf-8")
+    appended_from = len(source.splitlines()) + 1
+    source += "\n\ndef _elsewhere(path: str) -> None:\n    os.unlink(path)\n"
+    source += "\n\ndef _remove_scratch_mode(path: str) -> None:\n    os.fchmod(3, 0o600)\n"
+    violations = find_fs_mutation_violations(
+        source, "keygen.py", FS_MUTATION_EXCEPTIONS, rel_file="inspectors/keygen.py"
+    )
+    # Only the appended functions are judged here; the live file is the job of
+    # test_src_has_no_unapproved_fs_mutations.
+    assert {v.detail for v in violations if v.line >= appended_from} == {
+        "forbidden filesystem call: os.unlink in _elsewhere()",
+        "forbidden filesystem call: os.fchmod in _remove_scratch_mode()",
+    }
+
+    # A call permitted in _remove_scratch is not permitted in _write_scratch_pub.
+    swapped = FsException("inspectors/keygen.py", "_write_scratch_pub", "os.unlink", "wrong")
+    with pytest.raises(AssertionError, match="matches no call"):
+        validate_fs_exceptions([swapped])
