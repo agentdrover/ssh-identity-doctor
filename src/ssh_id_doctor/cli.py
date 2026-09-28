@@ -17,6 +17,12 @@ from typing import NoReturn
 from ssh_id_doctor import __version__
 from ssh_id_doctor.adapters.github import GitHubRegistryAdapter
 from ssh_id_doctor.exit_codes import ExitCode
+from ssh_id_doctor.explain import (
+    explain_finding,
+    render_explain_json,
+    render_explain_markdown,
+    render_explain_terminal,
+)
 from ssh_id_doctor.inspectors import RequiredSourceError
 from ssh_id_doctor.inspectors.agent import SSHAgentAdapter
 from ssh_id_doctor.inspectors.keygen import _FINGERPRINT_RE, PublicKeyInspector
@@ -150,8 +156,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_scan_args(rotation)
 
-    explain = sub.add_parser("explain", help="explain a finding (not implemented yet)")
-    explain.add_argument("finding_id")
+    explain = sub.add_parser(
+        "explain",
+        help="explain a finding by stable id (§5.1)",
+        description="Explain a finding by stable id with evidence and manual remediation.",
+        epilog=PRIVACY_TEXT,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    explain.add_argument(
+        "finding_id",
+        metavar="FINDING_ID",
+        help="Stable ID of the finding to explain (format <RULE>-<12 hex>)",
+    )
+    _add_common_scan_args(explain)
     sub.add_parser("version", help="print the version and exit")
     return parser
 
@@ -352,6 +369,115 @@ def _run_rotation_plan(args: argparse.Namespace) -> int:
     return ExitCode.OK
 
 
+def _run_explain(args: argparse.Namespace) -> int:
+    if not (math.isfinite(args.timeout) and args.timeout > 0):
+        print(f"{PROG}: error: --timeout must be positive", file=sys.stderr)
+        return ExitCode.INVALID_ARGS
+
+    home = Path(os.environ.get("HOME", "/"))
+
+    if args.ssh_dir is not None:
+        ssh_dir_path = Path(args.ssh_dir)
+        if not ssh_dir_path.exists() or not ssh_dir_path.is_dir():
+            print(
+                f"{PROG}: error: --ssh-dir '{args.ssh_dir}' is not a directory",
+                file=sys.stderr,
+            )
+            return ExitCode.INVALID_ARGS
+    else:
+        ssh_dir_path = home / ".ssh"
+
+    config_path = Path(args.config) if args.config is not None else ssh_dir_path / "config"
+
+    if args.output:
+        try:
+            validate_output_path(args.output, ssh_dir_path)
+        except ValueError as exc:
+            print(f"{PROG}: error: {exc}", file=sys.stderr)
+            return ExitCode.INVALID_ARGS
+
+    if args.verbose:
+        msg = (
+            f"[diag] Explaining finding {args.finding_id} with "
+            f"ssh_dir={ssh_dir_path.name}, timeout={args.timeout}s"
+        )
+        print(msg, file=sys.stderr)
+
+    keygen = PublicKeyInspector()
+    agent_adapter = None if args.no_agent else SSHAgentAdapter(keygen)
+    github_adapter = GitHubRegistryAdapter(keygen) if args.github else None
+
+    orchestrator = ScanOrchestrator(
+        keygen=keygen,
+        agent_adapter=agent_adapter,
+        github_adapter=github_adapter,
+    )
+
+    opts = OrchestratorOptions(
+        ssh_dir=ssh_dir_path,
+        config_path=config_path,
+        home=home,
+        check_agent=not args.no_agent,
+        check_github=args.github,
+        timeout=args.timeout,
+    )
+
+    try:
+        snapshot = orchestrator.run(opts)
+    except RequiredSourceError as exc:
+        print(
+            f"{PROG}: required source failed: {exc}\n"
+            "Remediation: install OpenSSH tools (ssh-keygen) and ensure they are on PATH.",
+            file=sys.stderr,
+        )
+        return ExitCode.REQUIRED_SCAN_FAILED
+
+    target_finding = next((f for f in snapshot.findings if f.id == args.finding_id), None)
+    if target_finding is None:
+        print(
+            f"{PROG}: error: finding '{args.finding_id}' not found",
+            file=sys.stderr,
+        )
+        print(
+            "Run 'ssh-id-doctor scan' with the same options to discover current findings.",
+            file=sys.stderr,
+        )
+        rule_prefix = args.finding_id.split("-")[0] if "-" in args.finding_id else args.finding_id
+        matching_findings = [f for f in snapshot.findings if f.rule_id == rule_prefix]
+        if matching_findings:
+            print(f"Existing findings for rule {rule_prefix}:", file=sys.stderr)
+            for mf in matching_findings:
+                print(f"  - {mf.id}", file=sys.stderr)
+        return ExitCode.INVALID_ARGS
+
+    if args.redact:
+        snapshot = redact(snapshot, args.redact)
+        target_finding = next(f for f in snapshot.findings if f.id == args.finding_id)
+
+    explanation = explain_finding(target_finding)
+
+    fmt = args.format
+    if fmt == "json":
+        rendered = render_explain_json(explanation)
+    elif fmt == "md":
+        rendered = render_explain_markdown(explanation)
+    else:
+        rendered = render_explain_terminal(explanation)
+
+    if args.output:
+        try:
+            write_report_atomically(rendered, args.output)
+        except OutputWriteError as exc:
+            print(f"{PROG}: failed to write report: {exc}", file=sys.stderr)
+            return ExitCode.REPORT_WRITE_FAILED
+    else:
+        sys.stdout.write(rendered)
+        if not rendered.endswith("\n"):
+            sys.stdout.write("\n")
+
+    return ExitCode.OK
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "version":
@@ -361,5 +487,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_scan(args)
     if args.command == "rotation-plan":
         return _run_rotation_plan(args)
+    if args.command == "explain":
+        return _run_explain(args)
     print(f"{PROG}: {args.command}: not implemented", file=sys.stderr)
     return ExitCode.INVALID_ARGS
