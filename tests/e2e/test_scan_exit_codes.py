@@ -246,3 +246,31 @@ def test_default_timeout_is_ten_seconds(
     assert rc == ExitCode.OK
     assert {tool for tool, _ in calls} == {"ssh-keygen", "ssh-add", "gh"}
     assert [t for _, t in calls] == [10.0] * len(calls)
+
+
+def test_non_finite_timeout_is_rejected(
+    home_basic: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review #703 (ee143e98912cd04f): NaN slips past '<= 0' and inf never
+    expires, so both would lift the limit. Only a finite positive number is a
+    timeout, at the CLI and at the process.run security boundary."""
+    for raw in ("nan", "inf"):
+        rc = main(
+            [
+                "scan",
+                "--no-agent",
+                "--timeout",
+                raw,
+                "--ssh-dir",
+                str(home_basic / ".ssh"),
+                "--config",
+                str(home_basic / ".ssh" / "config"),
+            ]
+        )
+        captured = capsys.readouterr()
+        assert rc == ExitCode.INVALID_ARGS, raw
+        assert "--timeout must be positive" in captured.err, raw
+
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="timeout"):
+            process.run(["ssh-keygen", "-V"], timeout=bad, max_output=1024)

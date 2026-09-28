@@ -7,6 +7,7 @@ redaction (§9 step 10), and atomic output writing (§12).
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 from collections.abc import Sequence
@@ -136,7 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _run_scan(args: argparse.Namespace) -> int:
-    if args.timeout <= 0:
+    if not (math.isfinite(args.timeout) and args.timeout > 0):
         print(f"{PROG}: error: --timeout must be positive", file=sys.stderr)
         return ExitCode.INVALID_ARGS
 
