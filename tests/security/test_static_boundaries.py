@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import ast
 import itertools
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
@@ -145,44 +145,101 @@ def _is_network_module(name: str) -> bool:
     return name.split(".")[0] in FORBIDDEN_NETWORK_MODULES
 
 
-def _dynamic_import_target(node: ast.Call) -> str | None:
-    """Literal module name of ``__import__("x")`` / ``importlib.import_module("x")``."""
-    func = node.func
-    is_dunder = isinstance(func, ast.Name) and func.id == "__import__"
-    is_importlib = isinstance(func, ast.Attribute) and func.attr == "import_module"
-    if not (is_dunder or is_importlib) or not node.args:
-        return None
-    first = node.args[0]
-    if isinstance(first, ast.Constant) and isinstance(first.value, str):
-        return first.value
+# Callables that import a module by name, and where they come from.
+_IMPORTER_SOURCES: dict[str, frozenset[str]] = {
+    "importlib": frozenset({"import_module", "__import__"}),
+    "builtins": frozenset({"__import__"}),
+}
+
+
+def _importer_names(tree: ast.AST) -> set[str]:
+    """Local names bound to an importer: ``__import__`` plus from-import aliases.
+
+    ``from importlib import import_module as im`` binds ``im``;
+    ``from builtins import __import__ as imp`` binds ``imp``.
+    """
+    names = {"__import__"}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.ImportFrom) and node.level == 0):
+            continue
+        importers = _IMPORTER_SOURCES.get(node.module or "", frozenset())
+        for alias in node.names:
+            if alias.name in importers:
+                names.add(alias.asname or alias.name)
+    return names
+
+
+def _literal_module_arg(node: ast.Call) -> str | None:
+    """The module name passed positionally or as ``name=``, when it is a literal."""
+    candidates = [*node.args[:1], *(kw.value for kw in node.keywords if kw.arg == "name")]
+    for arg in candidates:
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return arg.value
     return None
 
 
-def _imported_modules(node: ast.AST) -> list[str]:
+def _dynamic_import_target(node: ast.Call, importers: set[str]) -> str | None:
+    """Literal module of ``__import__``/``import_module``/``builtins.__import__`` calls.
+
+    Any attribute call ``<x>.import_module`` / ``<x>.__import__`` counts, whatever
+    ``<x>`` is bound to (``importlib``, ``builtins`` or an alias of either).
+    """
+    func = node.func
+    by_name = isinstance(func, ast.Name) and func.id in importers
+    by_attr = isinstance(func, ast.Attribute) and func.attr in {"import_module", "__import__"}
+    if not (by_name or by_attr):
+        return None
+    return _literal_module_arg(node)
+
+
+def _star_import_problem(node: ast.AST, modules: Collection[str]) -> str | None:
+    """``from <module> import *`` for a module whose names we must resolve."""
+    if (
+        isinstance(node, ast.ImportFrom)
+        and node.level == 0
+        and node.module in modules
+        and any(alias.name == "*" for alias in node.names)
+    ):
+        return f"from {node.module} import *"
+    return None
+
+
+def _imported_modules(node: ast.AST, importers: set[str]) -> list[str]:
     if isinstance(node, ast.Import):
         return [alias.name for alias in node.names]
     if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
         return [node.module]
     if isinstance(node, ast.Call):
-        target = _dynamic_import_target(node)
+        target = _dynamic_import_target(node, importers)
         return [target] if target else []
     return []
 
 
 def find_network_violations(source_code: str, filename: str) -> list[Violation]:
-    """Imports (static or literal dynamic) of network modules (SEC-004)."""
+    """Imports (static or literal dynamic) of network modules (SEC-004).
+
+    A star import from importlib/builtins cannot be resolved and is itself refused.
+    """
     tree = ast.parse(source_code, filename=filename)
-    return [
-        Violation(
-            file=filename,
-            line=getattr(node, "lineno", 1),
-            rule="SEC-004",
-            detail=f"forbidden network import: {name}",
+    importers = _importer_names(tree)
+    violations: list[Violation] = []
+    for node in ast.walk(tree):
+        line = getattr(node, "lineno", 1)
+        star = _star_import_problem(node, _IMPORTER_SOURCES)
+        if star is not None:
+            detail = f"unresolvable star import: {star}"
+            violations.append(Violation(file=filename, line=line, rule="SEC-004", detail=detail))
+        violations.extend(
+            Violation(
+                file=filename,
+                line=line,
+                rule="SEC-004",
+                detail=f"forbidden network import: {name}",
+            )
+            for name in _imported_modules(node, importers)
+            if _is_network_module(name)
         )
-        for node in ast.walk(tree)
-        for name in _imported_modules(node)
-        if _is_network_module(name)
-    ]
+    return violations
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,23 +251,37 @@ class FsCall:
     call: str
 
 
-def _module_aliases(tree: ast.AST) -> tuple[dict[str, str], dict[str, str]]:
-    """Map local names to modules (``import os as o``) and functions (``from os import rm``)."""
-    modules: dict[str, str] = {}
-    functions: dict[str, str] = {}
+class _Aliases(NamedTuple):
+    modules: dict[str, str]
+    functions: dict[str, str]
+    stars: list[tuple[int, str]]
+
+
+def _module_aliases(tree: ast.AST) -> _Aliases:
+    """Map local names to modules (``import os as o``) and functions (``from os import rm``).
+
+    ``from os import *`` / ``from shutil import *`` is recorded as a star (itself a
+    violation) and binds every forbidden name of that module as a bare function.
+    """
+    aliases = _Aliases({}, {}, [])
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name in _FORBIDDEN_BY_MODULE:
-                    modules[alias.asname or alias.name] = alias.name
-        elif isinstance(node, ast.ImportFrom) and node.level == 0:
-            forbidden = _FORBIDDEN_BY_MODULE.get(node.module or "")
-            if forbidden is None:
-                continue
+                    aliases.modules[alias.asname or alias.name] = alias.name
+            continue
+        star = _star_import_problem(node, _FORBIDDEN_BY_MODULE)
+        if star is not None and isinstance(node, ast.ImportFrom) and node.module:
+            aliases.stars.append((node.lineno, star))
+            for name in _FORBIDDEN_BY_MODULE[node.module]:
+                aliases.functions.setdefault(name, f"{node.module}.{name}")
+            continue
+        if isinstance(node, ast.ImportFrom) and node.level == 0:
+            forbidden = _FORBIDDEN_BY_MODULE.get(node.module or "", frozenset())
             for alias in node.names:
                 if alias.name in forbidden:
-                    functions[alias.asname or alias.name] = f"{node.module}.{alias.name}"
-    return modules, functions
+                    aliases.functions[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    return aliases
 
 
 def _classify_call(
@@ -259,9 +330,11 @@ class _FsCallCollector(ast.NodeVisitor):
 def collect_fs_mutations(source_code: str, filename: str) -> list[FsCall]:
     """Every mutating filesystem call in the source, with its enclosing function."""
     tree = ast.parse(source_code, filename=filename)
-    collector = _FsCallCollector(*_module_aliases(tree))
+    aliases = _module_aliases(tree)
+    collector = _FsCallCollector(aliases.modules, aliases.functions)
     collector.visit(tree)
-    return collector.calls
+    stars = [FsCall(line=line, function="<module>", call=star) for line, star in aliases.stars]
+    return stars + collector.calls
 
 
 def find_fs_mutation_violations(
@@ -460,6 +533,30 @@ def mutate(p):
 
 _COMMENTS_ONLY = "# import socket\n'''from urllib import request'''\n"
 
+# Indirect spellings: dynamic importers by alias/keyword/builtins, star imports.
+_SYNTHETIC_INDIRECT = """
+import builtins
+import builtins as bi
+import importlib
+from importlib import import_module
+from importlib import import_module as im
+from builtins import __import__ as imp
+from importlib import *
+from os import *
+from shutil import *
+
+def reach(p):
+    import_module("socket")
+    im("ssl")
+    importlib.import_module(name="http.client")
+    __import__(name="ftplib")
+    builtins.__import__("smtplib")
+    bi.__import__("telnetlib")
+    imp("xmlrpc.client")
+    unlink(p)
+    rmtree(p)
+"""
+
 
 def test_checkers_catch_synthetic_violations(tmp_path: Path) -> None:
     """AC-2: each checker reports file and line on a synthetic source; stale exception fails."""
@@ -499,7 +596,31 @@ def test_checkers_catch_synthetic_violations(tmp_path: Path) -> None:
     with pytest.raises(AssertionError, match="non-existent file"):
         validate_fs_exceptions([ghost])
 
-    # 4. gh argv: -X POST, ssh-key, auth token, api without GET, --field, --method=POST.
+    # 4. Indirect spellings, each at its own line.
+    indirect = tmp_path / "synthetic_indirect.py"
+    indirect.write_text(_SYNTHETIC_INDIRECT, encoding="utf-8")
+    ind_lines = _SYNTHETIC_INDIRECT.splitlines()
+
+    def ind_line(fragment: str) -> int:
+        return next(i for i, text in enumerate(ind_lines, start=1) if fragment in text)
+
+    ind_net = {v.line for v in find_network_violations(_SYNTHETIC_INDIRECT, indirect.name)}
+    for fragment in (
+        'import_module("socket")',
+        'im("ssl")',
+        'import_module(name="http.client")',
+        '__import__(name="ftplib")',
+        'builtins.__import__("smtplib")',
+        'bi.__import__("telnetlib")',
+        'imp("xmlrpc.client")',
+        "from importlib import *",
+    ):
+        assert ind_line(fragment) in ind_net, fragment
+    ind_fs = {v.line for v in find_fs_mutation_violations(_SYNTHETIC_INDIRECT, indirect.name)}
+    for fragment in ("from os import *", "from shutil import *", "unlink(p)", "rmtree(p)"):
+        assert ind_line(fragment) in ind_fs, fragment
+
+    # 5. gh argv: -X POST, ssh-key, auth token, api without GET, --field, --method=POST.
     gh = find_gh_argv_violations(content, name)
     assert all(v.file == name for v in gh)
     gh_lines = {v.line for v in gh}
