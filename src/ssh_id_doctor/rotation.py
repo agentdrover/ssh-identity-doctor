@@ -134,7 +134,7 @@ def _describe_unresolved(item: UnresolvedItem) -> str:
         if item.source_line is not None
         else Path(item.source_file).name
     )
-    if item.kind == "unsupported_match" or "match" in item.detail.lower():
+    if item.kind == "unsupported_match":
         return (
             f"unresolved Match directive at {loc}: {item.detail} "
             "(identity bindings may exist in unevaluated Match block)"

@@ -628,3 +628,22 @@ def test_only_include_cycle_is_described_as_a_cycle() -> None:
     assert "cycle" not in by_line[6]
     assert "depth" in by_line[6]
     assert "Include cycle" in by_line[8]
+
+
+def test_include_item_with_match_in_detail_is_not_a_match_directive() -> None:
+    """Finding 733684454a30503d: classify by kind only, never by substrings of detail.
+
+    The positive Match case (kind=unsupported_match) is pinned by AC-4 on the real fixture.
+    """
+    details = ("mismatch.conf", "matching.conf", "/h/.ssh/conf.d/match.conf")
+    snapshot = _snapshot(
+        unresolved=tuple(
+            UnresolvedItem(kind="include_missing", detail=d, source_file=_CFG, source_line=line)
+            for line, d in enumerate(details, start=2)
+        )
+    )
+    unknowns = build_rotation_plan(snapshot, _FP_A).unknowns
+    for line in (2, 3, 4):
+        entry = next(u for u in unknowns if f"config:{line}" in u)
+        assert "Match" not in entry, entry
+        assert entry.startswith(f"unresolved Include directive at config:{line}"), entry
