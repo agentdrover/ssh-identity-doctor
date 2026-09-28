@@ -21,6 +21,7 @@ Guarantees, by construction rather than by caller discipline:
 
 from __future__ import annotations
 
+import math
 import os
 import signal
 import subprocess
@@ -68,7 +69,7 @@ def _validate(argv: object, timeout: float, max_output: int) -> list[str]:
         raise ValueError("argv must name an executable")
     if not all(isinstance(arg, str) for arg in argv):
         raise TypeError("every argv element must be a str")
-    if timeout <= 0:
+    if not (math.isfinite(timeout) and timeout > 0):
         raise ValueError("timeout must be positive")
     if max_output < 0:
         raise ValueError("max_output must not be negative")

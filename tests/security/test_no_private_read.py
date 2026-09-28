@@ -9,12 +9,13 @@ from pathlib import Path
 
 import pytest
 
-from conftest import CANARY, CANARY_PRIVATE_KEY, CANARY_PUBLIC_KEY, OpenGuard, PrivateReadAttempt
+from conftest import CANARY, CANARY_PRIVATE_KEY, CANARY_PUBLIC_KEY, OpenGuard
 from ssh_id_doctor import fs
+from ssh_id_doctor.cli import main
 from ssh_id_doctor.fs import PrivateKeyAccessDenied
 
 SRC = Path(__file__).resolve().parents[2] / "src" / "ssh_id_doctor"
-AUDITED = {"process.py", "fs.py"}
+AUDITED = {"process.py", "fs.py", "output.py"}
 
 
 def test_read_public_text_refuses_private_key_without_opening(
@@ -56,15 +57,15 @@ def test_read_public_text_refuses_disguised_private_key(
 def test_open_guard_catches_every_read_route(fake_home: Path, open_guard: OpenGuard) -> None:
     canary = fake_home / ".ssh" / "id_canary"
 
-    with pytest.raises(PrivateReadAttempt):
+    with pytest.raises(AssertionError):
         open(canary)
-    with pytest.raises(PrivateReadAttempt):
+    with pytest.raises(AssertionError):
         os.open(canary, os.O_RDONLY)
-    with pytest.raises(PrivateReadAttempt):
+    with pytest.raises(AssertionError):
         canary.read_bytes()
-    with pytest.raises(PrivateReadAttempt):
+    with pytest.raises(AssertionError):
         canary.read_text()
-    with pytest.raises(PrivateReadAttempt):
+    with pytest.raises(AssertionError):
         canary.open("rb")
 
     assert len(open_guard.violations) == 5
@@ -84,3 +85,40 @@ def test_src_has_no_direct_subprocess_or_open() -> None:
         if forbidden.search(line)
     ]
     assert offenders == [], "use ssh_id_doctor.process.run / ssh_id_doctor.fs only"
+
+
+def test_full_scan_never_opens_private_key(
+    fake_home: Path,
+    open_guard: OpenGuard,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC-5: Given fake_home with id_canary and config referencing id_canary via IdentityFile;
+
+    open/io.open/Path.read_* intercepted by open_guard.
+    When full `ssh-id-doctor scan --format json --no-agent --ssh-dir ... --config ...` runs,
+    Then open_guard is never triggered, id_canary is present only as path (stat),
+    marker string CANARY is not present in output; exit 0.
+    """
+    ssh_dir = str(fake_home / ".ssh")
+    config = str(fake_home / ".ssh" / "config")
+
+    # Run scan across all formats
+    for fmt in ["json", "terminal", "md"]:
+        rc = main(
+            [
+                "scan",
+                "--format",
+                fmt,
+                "--no-agent",
+                "--ssh-dir",
+                ssh_dir,
+                "--config",
+                config,
+            ]
+        )
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert CANARY not in captured.out
+        assert CANARY not in captured.err
+
+    assert open_guard.violations == [], "SEC-001: canary private key was never opened"

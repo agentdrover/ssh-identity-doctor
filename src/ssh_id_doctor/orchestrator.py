@@ -49,15 +49,15 @@ class SSHConfigParserProtocol(Protocol):
 
 
 class PublicKeyInspectorProtocol(Protocol):
-    def fingerprint(self, public_line: str) -> Any: ...
+    def fingerprint(self, public_line: str, *, timeout: float = ...) -> Any: ...
 
 
 class SSHAgentAdapterProtocol(Protocol):
-    def list_identities(self) -> AgentResult: ...
+    def list_identities(self, timeout: float = ...) -> AgentResult: ...
 
 
 class GitHubRegistryAdapterProtocol(Protocol):
-    def list_keys(self) -> RegistryResult: ...
+    def list_keys(self, timeout: float = ...) -> RegistryResult: ...
 
 
 @dataclass
@@ -70,6 +70,13 @@ class OrchestratorOptions:
     check_agent: bool = True
     check_github: bool = False
     rules: Sequence[Rule] | None = None
+    # Seconds for every external tool (ssh-keygen, ssh-add, gh); None keeps
+    # each adapter's own default (§5.2 --timeout).
+    timeout: float | None = None
+
+    def tool_kwargs(self) -> dict[str, float]:
+        """Keyword arguments that hand the timeout to an external-tool call."""
+        return {} if self.timeout is None else {"timeout": self.timeout}
 
 
 class ScanOrchestrator:
@@ -96,11 +103,17 @@ class ScanOrchestrator:
             self._agent = SSHAgentAdapter()
         self._github = github_adapter
 
+    def _fingerprint(self, public_line: str, timeout: float | None) -> Any:
+        if timeout is None:
+            return self._keygen.fingerprint(public_line)
+        return self._keygen.fingerprint(public_line, timeout=timeout)
+
     def run(self, options: OrchestratorOptions | None = None) -> ScanSnapshot:
         opts = options or OrchestratorOptions()
         home = Path(opts.home) if opts.home else Path(os.environ.get("HOME", "/"))
         ssh_dir = Path(opts.ssh_dir) if opts.ssh_dir else home / ".ssh"
         config_path = Path(opts.config_path) if opts.config_path else ssh_dir / "config"
+        tool_kwargs = opts.tool_kwargs()
 
         started_at = datetime.now(UTC).isoformat()
         scan_id = str(uuid.uuid4())
@@ -180,7 +193,7 @@ class ScanOrchestrator:
         pub_keys_with_info: list[tuple[PublicKeyObservation, Any]] = []
         for pub_obs in pub_observations:
             if pub_obs.key_line:
-                info = self._keygen.fingerprint(pub_obs.key_line)
+                info = self._fingerprint(pub_obs.key_line, opts.timeout)
                 pub_keys_with_info.append((pub_obs, info))
             else:
                 pub_keys_with_info.append((pub_obs, None))
@@ -188,7 +201,7 @@ class ScanOrchestrator:
         cfg_refs_with_info: list[tuple[LocalReference, Any]] = []
         for ref in cfg_references:
             if ref.public_key_text:
-                info = self._keygen.fingerprint(ref.public_key_text)
+                info = self._fingerprint(ref.public_key_text, opts.timeout)
                 cfg_refs_with_info.append((ref, info))
             else:
                 cfg_refs_with_info.append((ref, None))
@@ -197,7 +210,7 @@ class ScanOrchestrator:
         agent_identities: list[Any] = []
         if opts.check_agent and self._agent is not None:
             try:
-                agent_res = self._agent.list_identities()
+                agent_res = self._agent.list_identities(**tool_kwargs)
                 if hasattr(agent_res, "identities"):
                     agent_identities.extend(agent_res.identities)
                 if hasattr(agent_res, "as_coverage"):
@@ -233,7 +246,7 @@ class ScanOrchestrator:
         registry_bindings: list[RegistryBinding] = []
         if opts.check_github and self._github is not None:
             try:
-                gh_res = self._github.list_keys()
+                gh_res = self._github.list_keys(**tool_kwargs)
                 registry_bindings.extend(gh_res.bindings)
                 sources.append(gh_res.as_coverage())
             except RequiredSourceError:
