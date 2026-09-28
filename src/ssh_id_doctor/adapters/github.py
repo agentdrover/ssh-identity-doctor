@@ -242,7 +242,7 @@ class GitHubRegistryAdapter:
                 )
                 continue
 
-            info = self._keygen.fingerprint(key_text.strip())
+            info = self._keygen.fingerprint(key_text.strip(), timeout=timeout)
             if isinstance(info, KeyInfo):
                 raw_id = record.get("id")
                 key_id = str(raw_id) if raw_id is not None else None

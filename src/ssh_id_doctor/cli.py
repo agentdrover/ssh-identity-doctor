@@ -144,13 +144,6 @@ def _run_scan(args: argparse.Namespace) -> int:
 
     if args.ssh_dir is not None:
         ssh_dir_path = Path(args.ssh_dir)
-        # Compatibility with validation commands referencing fixture/.ssh when only fixture exists
-        if (
-            not ssh_dir_path.exists()
-            and ssh_dir_path.name == ".ssh"
-            and ssh_dir_path.parent.is_dir()
-        ):
-            ssh_dir_path = ssh_dir_path.parent
         if not ssh_dir_path.exists() or not ssh_dir_path.is_dir():
             print(
                 f"{PROG}: error: --ssh-dir '{args.ssh_dir}' is not a directory",
@@ -160,20 +153,7 @@ def _run_scan(args: argparse.Namespace) -> int:
     else:
         ssh_dir_path = home / ".ssh"
 
-    if args.config is not None:
-        config_path = Path(args.config)
-        # Compatibility with config inside virtual .ssh path
-        if not config_path.exists() and ".ssh" in config_path.parts:
-            alt_parts = [p for p in config_path.parts if p != ".ssh"]
-            alt_path = (
-                Path(*alt_parts)
-                if not config_path.is_absolute()
-                else Path(config_path.anchor, *alt_parts)
-            )
-            if alt_path.is_file():
-                config_path = alt_path
-    else:
-        config_path = ssh_dir_path / "config"
+    config_path = Path(args.config) if args.config is not None else ssh_dir_path / "config"
 
     if args.output:
         try:
@@ -202,6 +182,7 @@ def _run_scan(args: argparse.Namespace) -> int:
         home=home,
         check_agent=not args.no_agent,
         check_github=args.github,
+        timeout=args.timeout,
     )
 
     try:

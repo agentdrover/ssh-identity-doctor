@@ -179,7 +179,7 @@ class SSHAgentAdapter:
             # RequiredSourceError (ssh-keygen missing/hung) propagates on purpose:
             # ssh-keygen is a required source (exit 2), the agent is not. Masking
             # it as an unavailable agent would blame the wrong source.
-            info = self._keygen.fingerprint(line)
+            info = self._keygen.fingerprint(line, timeout=timeout)
             if isinstance(info, KeyInfo):
                 comments = _extract_comments(line, info)
                 identities.append(
