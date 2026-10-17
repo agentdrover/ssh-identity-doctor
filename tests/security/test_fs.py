@@ -10,6 +10,7 @@ from __future__ import annotations
 import builtins
 import io
 import os
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,7 @@ import pytest
 from conftest import CANARY, CANARY_PRIVATE_KEY
 from ssh_id_doctor import fs
 from ssh_id_doctor.domain import Resolution
-from ssh_id_doctor.fs import NotAConfigFile, PrivateKeyAccessDenied
+from ssh_id_doctor.fs import NotAConfigFile, NotAKnownHostsFile, PrivateKeyAccessDenied
 
 
 @pytest.fixture
@@ -110,3 +111,179 @@ def test_read_config_text_refuses_oversize_and_private_material(tmp_path: Path) 
     with pytest.raises(PrivateKeyAccessDenied) as leaked:
         fs.read_config_text(private)
     assert CANARY not in str(leaked.value)
+
+
+def test_read_known_hosts_text_refusals(tmp_path: Path, opened_paths: list[str]) -> None:
+    """AC-1: every unsafe known_hosts path is refused before any open (name not
+    known_hosts; a known_hosts symlink to a differently named file; a known_hosts
+    symlink to a known_hosts file outside ssh_dir; ssh_dir/sub a symlink to an
+    outside directory; a FIFO); a private-key header on a later line and content
+    over max_bytes are refused only after reading. Every message names the base
+    name only."""
+    ssh_dir = tmp_path / "ssh"
+    ssh_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    valid_line = "example.com ssh-ed25519 AAAA\n"
+
+    # 1. name is not known_hosts.
+    (ssh_dir / "known_hosts2").write_text(valid_line)
+    opened_paths.clear()
+    with pytest.raises(NotAKnownHostsFile) as wrong_name:
+        fs.read_known_hosts_text(ssh_dir / "known_hosts2", ssh_dir=ssh_dir)
+    assert opened_paths == []
+    assert "known_hosts2" in str(wrong_name.value)
+    assert str(ssh_dir) not in str(wrong_name.value)
+
+    # 2. known_hosts symlink -> a file with a different name, inside ssh_dir.
+    (ssh_dir / "other_name").write_text(valid_line)
+    (ssh_dir / "known_hosts").symlink_to(ssh_dir / "other_name")
+    opened_paths.clear()
+    with pytest.raises(NotAKnownHostsFile):
+        fs.read_known_hosts_text(ssh_dir / "known_hosts", ssh_dir=ssh_dir)
+    assert opened_paths == []
+    (ssh_dir / "known_hosts").unlink()
+    (ssh_dir / "other_name").unlink()
+
+    # 3. known_hosts symlink -> a known_hosts file outside ssh_dir.
+    (outside / "known_hosts").write_text(valid_line)
+    (ssh_dir / "known_hosts").symlink_to(outside / "known_hosts")
+    opened_paths.clear()
+    with pytest.raises(NotAKnownHostsFile):
+        fs.read_known_hosts_text(ssh_dir / "known_hosts", ssh_dir=ssh_dir)
+    assert opened_paths == []
+    (ssh_dir / "known_hosts").unlink()
+
+    # 4. ssh_dir/sub is a symlink to an outside directory holding known_hosts.
+    (ssh_dir / "sub").symlink_to(outside, target_is_directory=True)
+    opened_paths.clear()
+    with pytest.raises(NotAKnownHostsFile):
+        fs.read_known_hosts_text(ssh_dir / "sub" / "known_hosts", ssh_dir=ssh_dir)
+    assert opened_paths == []
+    (ssh_dir / "sub").unlink()
+    (outside / "known_hosts").unlink()
+
+    # 5. FIFO named known_hosts, inside ssh_dir: refused before open (S_ISREG check).
+    fifo = ssh_dir / "known_hosts"
+    os.mkfifo(fifo)
+    opened_paths.clear()
+    with pytest.raises(NotAKnownHostsFile):
+        fs.read_known_hosts_text(fifo, ssh_dir=ssh_dir)
+    assert opened_paths == []
+    fifo.unlink()
+
+    # 6. A private-key header on the second line is refused only after reading.
+    (ssh_dir / "known_hosts").write_text(valid_line + CANARY_PRIVATE_KEY)
+    opened_paths.clear()
+    with pytest.raises(PrivateKeyAccessDenied) as leaked:
+        fs.read_known_hosts_text(ssh_dir / "known_hosts", ssh_dir=ssh_dir)
+    assert CANARY not in str(leaked.value)
+    assert str(ssh_dir / "known_hosts") in opened_paths
+    opened_paths.clear()
+    (ssh_dir / "known_hosts").unlink()
+
+    # 7. Content over max_bytes is refused only after reading.
+    (ssh_dir / "known_hosts").write_text("example.com ssh-ed25519 " + "A" * 100 + "\n")
+    opened_paths.clear()
+    with pytest.raises(NotAKnownHostsFile) as too_big:
+        fs.read_known_hosts_text(ssh_dir / "known_hosts", ssh_dir=ssh_dir, max_bytes=16)
+    assert "A" * 50 not in str(too_big.value)
+    assert opened_paths != []
+    (ssh_dir / "known_hosts").unlink()
+
+    # Missing file is a distinct FileNotFoundError, not a refusal.
+    with pytest.raises(FileNotFoundError):
+        fs.read_known_hosts_text(ssh_dir / "known_hosts", ssh_dir=ssh_dir)
+
+
+def test_read_known_hosts_text_open_uses_nofollow_nonblock_cloexec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding #1794 gen1 (medium, test gap): a regression test that would
+    catch dropping O_NOFOLLOW/O_NONBLOCK/O_CLOEXEC from the real ``os.open`` call
+    in :func:`read_known_hosts_text` (AC-1's existing refusal tests only exercise
+    the *earlier*, pure-Python checks and never look at the flags passed to the
+    syscall itself)."""
+    ssh_dir = tmp_path / "ssh"
+    ssh_dir.mkdir()
+    target = ssh_dir / "known_hosts"
+    target.write_text("example.com ssh-ed25519 AAAA\n")
+
+    captured_flags: list[int] = []
+    real_open = os.open
+
+    def recording_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        captured_flags.append(flags)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", recording_open)
+
+    fs.read_known_hosts_text(target, ssh_dir=ssh_dir)
+
+    assert captured_flags, "read_known_hosts_text must call os.open"
+    flags = captured_flags[-1]
+    assert flags & os.O_NOFOLLOW
+    assert flags & os.O_NONBLOCK
+    assert flags & os.O_CLOEXEC
+
+
+def test_read_known_hosts_text_fstat_refuses_fifo_even_if_the_prior_stat_lied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding #1794 gen1 (medium, test gap): a regression test for the
+    ``fstat``-after-``open`` check, which today's AC-1 FIFO case never reaches
+    (that FIFO is already named ``known_hosts`` and so is refused by the earlier,
+    pre-open ``os.stat`` check). Here the pre-open ``stat`` is made to report a
+    regular file for a target that is actually a FIFO — simulating it being
+    swapped out between the two checks — so only the ``fstat`` on the opened fd
+    can catch it; removing that check would make this read succeed instead of
+    raising."""
+    ssh_dir = tmp_path / "ssh"
+    ssh_dir.mkdir()
+    target = ssh_dir / "known_hosts"
+    os.mkfifo(target)
+    real_target = os.path.realpath(target)
+    real_stat = os.stat
+
+    class _RegularFileStat:
+        def __init__(self, real_result: os.stat_result) -> None:
+            self._real = real_result
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real, name)
+
+        @property
+        def st_mode(self) -> int:
+            return stat.S_IFREG | 0o644
+
+    def lying_stat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        result = real_stat(path, *args, **kwargs)
+        if os.fspath(path) == real_target:
+            return _RegularFileStat(result)
+        return result
+
+    monkeypatch.setattr(os, "stat", lying_stat)
+
+    with pytest.raises(NotAKnownHostsFile):
+        fs.read_known_hosts_text(target, ssh_dir=ssh_dir)
+
+
+def test_read_known_hosts_text_permission_error_names_only_the_base_name(
+    tmp_path: Path,
+) -> None:
+    """Review finding #1794 gen1 (low, fs.py:266): an ``OSError`` raised by the
+    ``stat``/``open`` syscalls themselves (unlike the function's own explicit
+    refusals) must not leak the full path either — the stdlib formats
+    ``PermissionError`` with the complete path by default."""
+    ssh_dir = tmp_path / "ssh"
+    ssh_dir.mkdir()
+    target = ssh_dir / "known_hosts"
+    target.write_text("example.com ssh-ed25519 AAAA\n")
+    target.chmod(0o000)
+    try:
+        with pytest.raises(PermissionError) as exc_info:
+            fs.read_known_hosts_text(target, ssh_dir=ssh_dir)
+        assert str(ssh_dir) not in str(exc_info.value)
+        assert "known_hosts" in str(exc_info.value)
+    finally:
+        target.chmod(0o600)

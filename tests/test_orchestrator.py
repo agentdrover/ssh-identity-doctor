@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 
 import pytest
 
 from conftest import CANARY_PRIVATE_KEY, OpenGuard
 from ssh_id_doctor.adapters.github import RegistryResult, RegistryState
+from ssh_id_doctor.cli import main
 from ssh_id_doctor.domain import (
     Confidence,
     CoverageState,
@@ -17,8 +20,10 @@ from ssh_id_doctor.domain import (
     Resolution,
     ScanSnapshot,
     Severity,
+    SourceCoverage,
 )
 from ssh_id_doctor.inspectors.agent import AgentResult, AgentState
+from ssh_id_doctor.inspectors.keygen import KeyInfo, PublicKeyInspector
 from ssh_id_doctor.orchestrator import OrchestratorOptions, ScanOrchestrator
 from ssh_id_doctor.rules import finding_id
 
@@ -354,6 +359,190 @@ def _scan_home_basic(home: Path) -> ScanSnapshot:
             check_github=True,
         )
     )
+
+
+def test_known_hosts_coverage_states(
+    home_basic_setup: Path,
+    open_guard: OpenGuard,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC-4: all six known_hosts coverage states, the --no-known-hosts skip (with a
+    spy proving the reader is never called), and exit-code parity with/without
+    known_hosts present."""
+    ssh = home_basic_setup / ".ssh"
+    known_hosts = ssh / "known_hosts"
+    config = ssh / "config"
+    valid_ed25519 = (
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMwKQfiW86Yu6eXH3bYIk94OnoidaKLausFeWb3nT/iL"
+    )
+
+    def run(**overrides: object) -> ScanSnapshot:
+        opts = OrchestratorOptions(
+            home=home_basic_setup,
+            ssh_dir=ssh,
+            config_path=config,
+            check_agent=False,
+            check_github=False,
+            **overrides,  # type: ignore[arg-type]
+        )
+        return ScanOrchestrator().run(opts)
+
+    def coverage(snapshot: ScanSnapshot) -> SourceCoverage:
+        return next(s for s in snapshot.sources if s.source == "known_hosts")
+
+    # 1. no file -> unavailable, fixed detail.
+    assert not known_hosts.exists()
+    cov = coverage(run())
+    assert cov.state is CoverageState.UNAVAILABLE
+    assert cov.detail == "known_hosts not found"
+    assert cov.required is False
+
+    # 2. fs refusal (a FIFO named known_hosts) -> unavailable, detail is the class name.
+    os.mkfifo(known_hosts)
+    cov = coverage(run())
+    assert cov.state is CoverageState.UNAVAILABLE
+    assert cov.detail == "NotAKnownHostsFile"
+    known_hosts.unlink()
+
+    # 3. PermissionError (an unreadable regular file) -> unavailable, detail is the
+    # class name.
+    known_hosts.write_text(f"example.com {valid_ed25519}\n")
+    known_hosts.chmod(0o000)
+    try:
+        cov = coverage(run())
+        assert cov.state is CoverageState.UNAVAILABLE
+        assert cov.detail == "PermissionError"
+    finally:
+        known_hosts.chmod(0o600)
+        known_hosts.unlink()
+
+    # 4. empty / comments only -> empty.
+    known_hosts.write_text("# just a comment\n\n")
+    assert coverage(run()).state is CoverageState.EMPTY
+    known_hosts.unlink()
+
+    # 5. mixed valid and broken lines -> available; entries and unresolved both land
+    # in the snapshot.
+    known_hosts.write_text(f"example.com {valid_ed25519}\nbroken.example.com ssh-ed25519\n")
+    snap = run()
+    assert coverage(snap).state is CoverageState.AVAILABLE
+    assert len(snap.known_hosts) == 1
+    assert snap.known_hosts[0].hosts == ("example.com",)
+    assert any(u.kind == "incomplete_line" for u in snap.unresolved)
+    known_hosts.unlink()
+
+    # 6. every non-empty line broken -> malformed.
+    known_hosts.write_text("broken.example.com ssh-ed25519\n")
+    assert coverage(run()).state is CoverageState.MALFORMED
+    known_hosts.unlink()
+
+    # 7. --no-known-hosts -> skipped, and the reader is never called (spy on the
+    # orchestrator's own module reference).
+    known_hosts.write_text(f"example.com {valid_ed25519}\n")
+    calls: list[object] = []
+    import ssh_id_doctor.fs as fs_module
+
+    original = fs_module.read_known_hosts_text
+    monkeypatch.setattr(
+        fs_module,
+        "read_known_hosts_text",
+        lambda *a, **kw: calls.append((a, kw)) or original(*a, **kw),
+    )
+    snap = run(check_known_hosts=False)
+    assert coverage(snap).state is CoverageState.SKIPPED
+    assert calls == []
+
+    # Exit code does not depend on known_hosts state.
+    rc_with = main(
+        ["scan", "--format", "json", "--no-agent", "--ssh-dir", str(ssh), "--config", str(config)]
+    )
+    known_hosts.unlink()
+    rc_without = main(
+        ["scan", "--format", "json", "--no-agent", "--ssh-dir", str(ssh), "--config", str(config)]
+    )
+    assert rc_with == rc_without == 0
+    capsys.readouterr()
+
+    assert open_guard.violations == []
+
+
+def test_no_known_hosts_flag_reaches_all_three_cli_commands(
+    home_basic_setup: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Review finding #1794 gen1 (medium, test gap): AC-4's spy proves
+    --no-known-hosts reaches ``OrchestratorOptions``, but nothing drove it through
+    argparse end-to-end for the three commands that expose it (scan, rotation-plan,
+    explain). Spy on ``fs.read_known_hosts_text`` itself and run each command
+    through ``main()`` with and without the flag."""
+    ssh = home_basic_setup / ".ssh"
+    config = ssh / "config"
+    known_hosts = ssh / "known_hosts"
+    known_hosts.write_text(
+        "example.com ssh-ed25519 "
+        "AAAAC3NzaC1lZDI1NTE5AAAAIMwKQfiW86Yu6eXH3bYIk94OnoidaKLausFeWb3nT/iL\n"
+    )
+
+    import ssh_id_doctor.fs as fs_module
+
+    calls: list[object] = []
+    original = fs_module.read_known_hosts_text
+    monkeypatch.setattr(
+        fs_module,
+        "read_known_hosts_text",
+        lambda *a, **kw: calls.append((a, kw)) or original(*a, **kw),
+    )
+
+    base_args = ["--no-agent", "--ssh-dir", str(ssh), "--config", str(config)]
+
+    # scan
+    calls.clear()
+    rc = main(["scan", "--format", "json", "--no-known-hosts", *base_args])
+    capsys.readouterr()
+    assert rc == 0
+    assert calls == []
+
+    calls.clear()
+    rc = main(["scan", "--format", "json", *base_args])
+    data = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert calls != []
+    finding_ids = [f["id"] for f in data["findings"]]
+
+    # rotation-plan
+    keygen = PublicKeyInspector()
+    info = keygen.fingerprint((ssh / "id_ed25519.pub").read_text())
+    assert isinstance(info, KeyInfo)
+
+    calls.clear()
+    rc = main(["rotation-plan", info.fingerprint, "--format", "md", "--no-known-hosts", *base_args])
+    capsys.readouterr()
+    assert rc == 0
+    assert calls == []
+
+    calls.clear()
+    rc = main(["rotation-plan", info.fingerprint, "--format", "md", *base_args])
+    capsys.readouterr()
+    assert rc == 0
+    assert calls != []
+
+    # explain
+    assert finding_ids, "scan must have produced at least one finding to explain"
+    target_finding_id = finding_ids[0]
+
+    calls.clear()
+    rc = main(["explain", target_finding_id, "--format", "md", "--no-known-hosts", *base_args])
+    capsys.readouterr()
+    assert rc == 0
+    assert calls == []
+
+    calls.clear()
+    rc = main(["explain", target_finding_id, "--format", "md", *base_args])
+    capsys.readouterr()
+    assert rc == 0
+    assert calls != []
 
 
 def test_finding_ids_do_not_depend_on_the_scanned_home_root(

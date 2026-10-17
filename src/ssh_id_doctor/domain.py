@@ -141,6 +141,24 @@ class Finding:
 
 
 @dataclass(frozen=True, slots=True)
+class KnownHostEntry:
+    """One valid known_hosts(5) line (known_hosts source, task #1794).
+
+    Rules-only: never serialized by the JSON renderer, so schema 1.0 is
+    unaffected. ``hosts`` keeps the raw comma-separated tokens as written
+    (including a hashed ``|1|<salt>|<hash>`` token, which cannot be reversed).
+    """
+
+    source_file: str
+    line: int
+    marker: str | None
+    hosts: tuple[str, ...]
+    hashed: bool
+    key_type: str
+    fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
 class UnresolvedItem:
     """One parser or source item that could not be resolved (§7)."""
 
@@ -168,3 +186,6 @@ class ScanSnapshot:
     unreadable, outside_root), sorted by (source_file, source_line, path).
     Additive to schema 1.0; bound references live in Identity.local_references."""
     unresolved: tuple[UnresolvedItem, ...] = ()
+    known_hosts: tuple[KnownHostEntry, ...] = ()
+    """Parsed known_hosts(5) entries, for rules only (task #1788/#1794). Additive
+    to schema 1.0; the JSON renderer never emits this field."""

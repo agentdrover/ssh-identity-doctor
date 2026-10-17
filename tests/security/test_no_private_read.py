@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import re
@@ -85,6 +86,79 @@ def test_src_has_no_direct_subprocess_or_open() -> None:
         if forbidden.search(line)
     ]
     assert offenders == [], "use ssh_id_doctor.process.run / ssh_id_doctor.fs only"
+
+
+def _imported_module_names(tree: ast.AST) -> set[str]:
+    """Every module an import statement reaches, including `from pkg import submodule`
+    (which binds a name but also pulls in `pkg.submodule` as an importable module)."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module)
+            names.update(f"{node.module}.{alias.name}" for alias in node.names)
+    return names
+
+
+def _functions_calling_os_open(source: str) -> set[str]:
+    tree = ast.parse(source)
+    found: set[str] = set()
+
+    class _Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.stack: list[str] = []
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_Call(self, node: ast.Call) -> None:
+            func = node.func
+            if (
+                self.stack
+                and isinstance(func, ast.Attribute)
+                and func.attr == "open"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "os"
+            ):
+                found.add(self.stack[-1])
+            self.generic_visit(node)
+
+    _Visitor().visit(tree)
+    return found
+
+
+def test_known_hosts_inspector_boundaries() -> None:
+    """AC-2: inspectors/known_hosts.py passes the general open/subprocess ban (it is
+    not in AUDITED, so test_src_has_no_direct_subprocess_or_open already covers it)
+    and does not import ssh_id_doctor.process or subprocess by name; fs.py has
+    exactly three functions that call os.open — the three reader functions."""
+    known_hosts_path = SRC / "inspectors" / "known_hosts.py"
+    source = known_hosts_path.read_text()
+
+    forbidden = re.compile(
+        r"^\s*(?:import|from)\s+subprocess\b|\bsubprocess\.|(?<![\w.])open\("
+        r"|\.read_(?:bytes|text)\(|\bos\.open\(|\.open\("
+    )
+    offenders = [
+        f"{number}: {line}"
+        for number, line in enumerate(source.splitlines(), start=1)
+        if forbidden.search(line)
+    ]
+    assert offenders == [], "known_hosts.py must not open files or run subprocesses"
+
+    imported = _imported_module_names(ast.parse(source))
+    assert "ssh_id_doctor.process" not in imported
+    assert "subprocess" not in imported
+
+    fs_source = (SRC / "fs.py").read_text()
+    assert _functions_calling_os_open(fs_source) == {
+        "read_public_text",
+        "read_config_text",
+        "read_known_hosts_text",
+    }
 
 
 def test_full_scan_never_opens_private_key(

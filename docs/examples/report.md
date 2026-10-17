@@ -19,6 +19,7 @@
 | config | available | no | 9 host blocks parsed |
 | filesystem | available | yes | 3 public keys discovered |
 | github | unavailable | no | gh: not authenticated |
+| known_hosts | unavailable | no | known_hosts not found |
 
 ## Identities
 

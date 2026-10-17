@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import stat
 from pathlib import Path
 from unittest.mock import patch
 
+import jsonschema
+import pytest
+
 from ssh_id_doctor.cli import main
 from ssh_id_doctor.exit_codes import ExitCode
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCHEMA_PATH = REPO_ROOT / "src" / "ssh_id_doctor" / "reporting" / "schema" / "scan-1.0.json"
 
 
 def test_output_atomic_0600_and_exit_4_keeps_old_report(
@@ -96,3 +103,41 @@ def test_output_atomic_0600_and_exit_4_keeps_old_report(
         )
         assert rc_err == ExitCode.REPORT_WRITE_FAILED
         assert report_file.read_text() == "OLD"
+
+
+def test_known_hosts_json_schema(
+    home_basic: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC-5: with a known_hosts file present, `scan --format json` still validates
+    against schema 1.0, carries no `known_hosts` key, and reports an available
+    known_hosts source."""
+    ssh_dir = home_basic / ".ssh"
+    config = ssh_dir / "config"
+    (ssh_dir / "known_hosts").write_text(
+        "example.com ssh-ed25519 "
+        "AAAAC3NzaC1lZDI1NTE5AAAAIMwKQfiW86Yu6eXH3bYIk94OnoidaKLausFeWb3nT/iL\n"
+    )
+
+    exit_code = main(
+        [
+            "scan",
+            "--format",
+            "json",
+            "--no-agent",
+            "--ssh-dir",
+            str(ssh_dir),
+            "--config",
+            str(config),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == ExitCode.OK
+
+    data = json.loads(captured.out)
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    jsonschema.Draft202012Validator(schema).validate(data)
+
+    assert "known_hosts" not in data
+    source_map = {s["source"]: s for s in data["sources"]}
+    assert source_map["known_hosts"]["state"] == "available"

@@ -3,6 +3,7 @@
 Orchestrates all scan steps in order:
 1. FileSystemScanner: enumerate .pub files under --ssh-dir
 2. SSHConfigParser: parse ~/.ssh/config and resolve IdentityFile references
+2a. known_hosts(5): read and parse <ssh-dir>/known_hosts (optional, task #1794)
 3. PublicKeyInspector: fingerprint discovered public keys and config references
 4. SSHAgentAdapter: inspect identities in running agent
 5. GitHubRegistryAdapter: inspect remote keys (if enabled)
@@ -20,18 +21,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from ssh_id_doctor import references, scanner, ssh_config
+from ssh_id_doctor import fs, references, scanner, ssh_config
 from ssh_id_doctor.adapters.github import RegistryResult
 from ssh_id_doctor.aggregate import ScanObservations, build_snapshot
 from ssh_id_doctor.domain import (
     CoverageState,
+    KnownHostEntry,
     RegistryBinding,
     ScanSnapshot,
     SourceCoverage,
+    UnresolvedItem,
 )
 from ssh_id_doctor.inspectors import RequiredSourceError
 from ssh_id_doctor.inspectors.agent import AgentResult, SSHAgentAdapter
 from ssh_id_doctor.inspectors.keygen import PublicKeyInspector
+from ssh_id_doctor.inspectors.known_hosts import parse_known_hosts
 from ssh_id_doctor.references import LocalReference
 from ssh_id_doctor.rules import Rule, run_rules
 from ssh_id_doctor.scanner import PublicKeyObservation
@@ -69,6 +73,7 @@ class OrchestratorOptions:
     home: str | Path | None = None
     check_agent: bool = True
     check_github: bool = False
+    check_known_hosts: bool = True
     rules: Sequence[Rule] | None = None
     # Seconds for every external tool (ssh-keygen, ssh-add, gh); None keeps
     # each adapter's own default (§5.2 --timeout).
@@ -188,6 +193,57 @@ class ScanOrchestrator:
                 )
             )
 
+        # 2a. known_hosts (optional source, task #1794)
+        known_host_entries: list[KnownHostEntry] = []
+        known_hosts_unresolved: list[UnresolvedItem] = []
+        if opts.check_known_hosts:
+            known_hosts_path = ssh_dir / "known_hosts"
+            try:
+                known_hosts_text = fs.read_known_hosts_text(known_hosts_path, ssh_dir=ssh_dir)
+            except FileNotFoundError:
+                sources.append(
+                    SourceCoverage(
+                        source="known_hosts",
+                        state=CoverageState.UNAVAILABLE,
+                        required=False,
+                        detail="known_hosts not found",
+                    )
+                )
+            except (fs.NotAKnownHostsFile, PermissionError, OSError) as exc:
+                sources.append(
+                    SourceCoverage(
+                        source="known_hosts",
+                        state=CoverageState.UNAVAILABLE,
+                        required=False,
+                        detail=type(exc).__name__,
+                    )
+                )
+            else:
+                parsed = parse_known_hosts(known_hosts_text, str(known_hosts_path))
+                known_host_entries = list(parsed.entries)
+                known_hosts_unresolved = list(parsed.unresolved)
+                if known_host_entries:
+                    state = CoverageState.AVAILABLE
+                    detail = f"{len(known_host_entries)} entries parsed"
+                elif known_hosts_unresolved:
+                    state = CoverageState.MALFORMED
+                    detail = f"{len(known_hosts_unresolved)} lines could not be parsed"
+                else:
+                    state = CoverageState.EMPTY
+                    detail = "known_hosts is empty or comments only"
+                sources.append(
+                    SourceCoverage(source="known_hosts", state=state, required=False, detail=detail)
+                )
+        else:
+            sources.append(
+                SourceCoverage(
+                    source="known_hosts",
+                    state=CoverageState.SKIPPED,
+                    required=False,
+                    detail="known_hosts check skipped",
+                )
+            )
+
         # 3. PublicKeyInspector (fingerprint discovered public keys & config references)
         # RequiredSourceError from keygen must propagate!
         pub_keys_with_info: list[tuple[PublicKeyObservation, Any]] = []
@@ -292,6 +348,8 @@ class ScanOrchestrator:
             started_at=started_at,
             home=str(home),
             ssh_dir=str(ssh_dir),
+            unresolved=known_hosts_unresolved,
+            known_hosts=known_host_entries,
         )
         intermediate_snapshot = build_snapshot(obs)
 
@@ -317,6 +375,7 @@ class ScanOrchestrator:
             schema_version=intermediate_snapshot.schema_version,
             local_references=intermediate_snapshot.local_references,
             unresolved=intermediate_snapshot.unresolved,
+            known_hosts=intermediate_snapshot.known_hosts,
         )
 
 

@@ -18,6 +18,14 @@ ssh_config(5) file (FR-004a, §10 SEC-001/SEC-003): it refuses — before any
 literally named ``config``, so unlike public keys there is no name check),
 refuses content over a size limit, and refuses (after reading) content
 holding a private-key header on any line.
+
+:func:`read_known_hosts_text` is the third and last reading function, for one
+known_hosts(5) file (task #1794, §10 SEC-001/SEC-003). Like public keys it
+refuses by name before any ``open`` (the name must be ``known_hosts``, both
+as given and after resolving symlinks), and like discovery it refuses a
+target whose real location leaves ``ssh_dir`` via :func:`resolve_within`.
+Otherwise it follows :func:`read_config_text`: regular-file check before
+`open`, then a size limit and a private-key header check after reading.
 """
 
 from __future__ import annotations
@@ -37,6 +45,11 @@ MAX_PUBLIC_BYTES = 64 * 1024
 
 MAX_CONFIG_BYTES = 1024 * 1024
 """An ssh_config(5) file is plain text with a modest line count; larger is refused (AC-4)."""
+
+KNOWN_HOSTS_NAME = "known_hosts"
+
+MAX_KNOWN_HOSTS_BYTES = 10 * 1024 * 1024
+"""known_hosts can carry many thousands of host keys; still bounded against a wild read."""
 
 _PRIVATE_MARKERS: tuple[bytes, ...] = (
     b"openssh-key-v1",
@@ -59,6 +72,14 @@ class NotAConfigFile(ValueError):
     """A config path that cannot hold an ssh_config(5) file: not a regular file, or too large.
 
     Callers record such a path as unresolved instead of aborting a scan (AC-4).
+    """
+
+
+class NotAKnownHostsFile(ValueError):
+    """A known_hosts path that cannot hold the source: wrong name, outside the ssh
+    directory, not a regular file, or too large.
+
+    Callers record such a path as unavailable instead of aborting a scan (AC-4).
     """
 
 
@@ -212,4 +233,58 @@ def read_config_text(path: str | os.PathLike[str], *, max_bytes: int = MAX_CONFI
         raise PrivateKeyAccessDenied(f"{normalized.name!r} holds private-key material")
     if len(data) > max_bytes:
         raise NotAConfigFile(f"{normalized.name!r} exceeds {max_bytes} bytes; not a config file")
+    return data.decode("utf-8", errors="replace")
+
+
+def read_known_hosts_text(
+    path: str | os.PathLike[str],
+    *,
+    ssh_dir: str | os.PathLike[str],
+    max_bytes: int = MAX_KNOWN_HOSTS_BYTES,
+) -> str:
+    """Read one known_hosts(5) file (AC-1). The third of three functions that open a file.
+
+    Refuses — before any ``open`` — a path whose name is not ``known_hosts``;
+    one whose real location, per :func:`resolve_within`, leaves ``ssh_dir``
+    (covers a symlinked ancestor directory as well as the file itself) or
+    whose real name is not ``known_hosts`` either (a same-named symlink
+    pointing at a differently named file); and one that is not a regular file
+    (FIFO, socket, device). After reading, refuses content holding a
+    private-key header on any line, or over ``max_bytes``, just like
+    :func:`read_config_text`. The message names the file only by its base
+    name and never quotes file content — including an ``OSError`` raised by
+    the ``stat``/``open`` syscalls themselves (e.g. :class:`PermissionError`),
+    which the stdlib would otherwise format with the full path; those are
+    re-raised with the same exception type but a sanitized message. A
+    missing file raises ``FileNotFoundError``, distinct from a refusal.
+    """
+    normalized = _normalize(path)
+    if normalized.name != KNOWN_HOSTS_NAME:
+        raise NotAKnownHostsFile(f"refusing to read non-known_hosts file {normalized.name!r}")
+    real, resolution = resolve_within(ssh_dir, normalized)
+    if resolution is Resolution.MISSING:
+        raise FileNotFoundError(f"{normalized.name!r} not found")
+    if resolution is not Resolution.RESOLVED or real.name != KNOWN_HOSTS_NAME:
+        raise NotAKnownHostsFile(f"{normalized.name!r} is outside the ssh directory")
+    try:
+        file_mode = os.stat(real).st_mode
+    except OSError as exc:
+        raise type(exc)(f"{normalized.name!r}: {exc.strerror or type(exc).__name__}") from exc
+    if not stat.S_ISREG(file_mode):
+        raise NotAKnownHostsFile(f"{normalized.name!r} is not a regular file")
+    # O_NONBLOCK: should the path be swapped for a FIFO after the check above,
+    # the open still returns at once and the fstat below refuses it.
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        fd = os.open(real, flags)
+    except OSError as exc:
+        raise type(exc)(f"{normalized.name!r}: {exc.strerror or type(exc).__name__}") from exc
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise NotAKnownHostsFile(f"{normalized.name!r} is not a regular file")
+        data = handle.read(max_bytes + 1)
+    if looks_like_private_key(data):
+        raise PrivateKeyAccessDenied(f"{normalized.name!r} holds private-key material")
+    if len(data) > max_bytes:
+        raise NotAKnownHostsFile(f"{normalized.name!r} exceeds {max_bytes} bytes")
     return data.decode("utf-8", errors="replace")
