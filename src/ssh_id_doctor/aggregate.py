@@ -20,6 +20,7 @@ from ssh_id_doctor.domain import (
     Finding,
     HostBinding,
     Identity,
+    KnownHostEntry,
     LocalReference,
     LocalReferenceKind,
     Platform,
@@ -54,6 +55,7 @@ class ScanObservations:
     home: str | None = None
     ssh_dir: str | None = None
     unresolved: Sequence[UnresolvedItem] = ()
+    known_hosts: Sequence[KnownHostEntry] = ()
 
 
 @dataclass
@@ -370,6 +372,10 @@ def build_snapshot(observations: ScanObservations) -> ScanSnapshot:
         )
     )
 
+    sorted_known_hosts = tuple(
+        sorted(observations.known_hosts, key=lambda k: (k.source_file, k.line))
+    )
+
     return ScanSnapshot(
         scan_id=scan_id,
         started_at=started_at,
@@ -381,6 +387,7 @@ def build_snapshot(observations: ScanObservations) -> ScanSnapshot:
         findings=sorted_findings,
         local_references=_sorted_unbound(unbound_references),
         unresolved=sorted_unresolved,
+        known_hosts=sorted_known_hosts,
     )
 
 

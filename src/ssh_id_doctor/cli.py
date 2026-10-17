@@ -95,6 +95,12 @@ def _add_common_scan_args(parser: argparse.ArgumentParser) -> None:
         help="Skip querying SSH agent",
     )
     parser.add_argument(
+        "--no-known-hosts",
+        action="store_true",
+        default=False,
+        help="Skip reading <ssh-dir>/known_hosts",
+    )
+    parser.add_argument(
         "--redact",
         choices=["hosts", "paths", "all"],
         help="Redact sensitive data in report (hosts, paths, or all)",
@@ -220,6 +226,7 @@ def _run_scan(args: argparse.Namespace) -> int:
         home=home,
         check_agent=not args.no_agent,
         check_github=args.github,
+        check_known_hosts=not args.no_known_hosts,
         timeout=args.timeout,
     )
 
@@ -321,6 +328,7 @@ def _run_rotation_plan(args: argparse.Namespace) -> int:
         home=home,
         check_agent=not args.no_agent,
         check_github=args.github,
+        check_known_hosts=not args.no_known_hosts,
         timeout=args.timeout,
     )
 
@@ -419,6 +427,7 @@ def _run_explain(args: argparse.Namespace) -> int:
         home=home,
         check_agent=not args.no_agent,
         check_github=args.github,
+        check_known_hosts=not args.no_known_hosts,
         timeout=args.timeout,
     )
 

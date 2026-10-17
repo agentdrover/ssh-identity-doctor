@@ -18,7 +18,7 @@ import pytest
 from conftest import CANARY, CANARY_PRIVATE_KEY
 from ssh_id_doctor import fs
 from ssh_id_doctor.domain import Resolution
-from ssh_id_doctor.fs import NotAConfigFile, PrivateKeyAccessDenied
+from ssh_id_doctor.fs import NotAConfigFile, NotAKnownHostsFile, PrivateKeyAccessDenied
 
 
 @pytest.fixture
@@ -110,3 +110,86 @@ def test_read_config_text_refuses_oversize_and_private_material(tmp_path: Path) 
     with pytest.raises(PrivateKeyAccessDenied) as leaked:
         fs.read_config_text(private)
     assert CANARY not in str(leaked.value)
+
+
+def test_read_known_hosts_text_refusals(tmp_path: Path, opened_paths: list[str]) -> None:
+    """AC-1: every unsafe known_hosts path is refused before any open (name not
+    known_hosts; a known_hosts symlink to a differently named file; a known_hosts
+    symlink to a known_hosts file outside ssh_dir; ssh_dir/sub a symlink to an
+    outside directory; a FIFO); a private-key header on a later line and content
+    over max_bytes are refused only after reading. Every message names the base
+    name only."""
+    ssh_dir = tmp_path / "ssh"
+    ssh_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    valid_line = "example.com ssh-ed25519 AAAA\n"
+
+    # 1. name is not known_hosts.
+    (ssh_dir / "known_hosts2").write_text(valid_line)
+    opened_paths.clear()
+    with pytest.raises(NotAKnownHostsFile) as wrong_name:
+        fs.read_known_hosts_text(ssh_dir / "known_hosts2", ssh_dir=ssh_dir)
+    assert opened_paths == []
+    assert "known_hosts2" in str(wrong_name.value)
+    assert str(ssh_dir) not in str(wrong_name.value)
+
+    # 2. known_hosts symlink -> a file with a different name, inside ssh_dir.
+    (ssh_dir / "other_name").write_text(valid_line)
+    (ssh_dir / "known_hosts").symlink_to(ssh_dir / "other_name")
+    opened_paths.clear()
+    with pytest.raises(NotAKnownHostsFile):
+        fs.read_known_hosts_text(ssh_dir / "known_hosts", ssh_dir=ssh_dir)
+    assert opened_paths == []
+    (ssh_dir / "known_hosts").unlink()
+    (ssh_dir / "other_name").unlink()
+
+    # 3. known_hosts symlink -> a known_hosts file outside ssh_dir.
+    (outside / "known_hosts").write_text(valid_line)
+    (ssh_dir / "known_hosts").symlink_to(outside / "known_hosts")
+    opened_paths.clear()
+    with pytest.raises(NotAKnownHostsFile):
+        fs.read_known_hosts_text(ssh_dir / "known_hosts", ssh_dir=ssh_dir)
+    assert opened_paths == []
+    (ssh_dir / "known_hosts").unlink()
+
+    # 4. ssh_dir/sub is a symlink to an outside directory holding known_hosts.
+    (ssh_dir / "sub").symlink_to(outside, target_is_directory=True)
+    opened_paths.clear()
+    with pytest.raises(NotAKnownHostsFile):
+        fs.read_known_hosts_text(ssh_dir / "sub" / "known_hosts", ssh_dir=ssh_dir)
+    assert opened_paths == []
+    (ssh_dir / "sub").unlink()
+    (outside / "known_hosts").unlink()
+
+    # 5. FIFO named known_hosts, inside ssh_dir: refused before open (S_ISREG check).
+    fifo = ssh_dir / "known_hosts"
+    os.mkfifo(fifo)
+    opened_paths.clear()
+    with pytest.raises(NotAKnownHostsFile):
+        fs.read_known_hosts_text(fifo, ssh_dir=ssh_dir)
+    assert opened_paths == []
+    fifo.unlink()
+
+    # 6. A private-key header on the second line is refused only after reading.
+    (ssh_dir / "known_hosts").write_text(valid_line + CANARY_PRIVATE_KEY)
+    opened_paths.clear()
+    with pytest.raises(PrivateKeyAccessDenied) as leaked:
+        fs.read_known_hosts_text(ssh_dir / "known_hosts", ssh_dir=ssh_dir)
+    assert CANARY not in str(leaked.value)
+    assert str(ssh_dir / "known_hosts") in opened_paths
+    opened_paths.clear()
+    (ssh_dir / "known_hosts").unlink()
+
+    # 7. Content over max_bytes is refused only after reading.
+    (ssh_dir / "known_hosts").write_text("example.com ssh-ed25519 " + "A" * 100 + "\n")
+    opened_paths.clear()
+    with pytest.raises(NotAKnownHostsFile) as too_big:
+        fs.read_known_hosts_text(ssh_dir / "known_hosts", ssh_dir=ssh_dir, max_bytes=16)
+    assert "A" * 50 not in str(too_big.value)
+    assert opened_paths != []
+    (ssh_dir / "known_hosts").unlink()
+
+    # Missing file is a distinct FileNotFoundError, not a refusal.
+    with pytest.raises(FileNotFoundError):
+        fs.read_known_hosts_text(ssh_dir / "known_hosts", ssh_dir=ssh_dir)

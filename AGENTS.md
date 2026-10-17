@@ -26,8 +26,12 @@ request, macOS only on a push to `main` or a manual `workflow_dispatch`. Confirm
   `ssh_id_doctor.process.run` (argv list, `shell=False`, required timeout,
   bounded output, whitelisted env). No `subprocess` anywhere else.
 - **Filesystem safety (SEC-003).** Discover with `ssh_id_doctor.fs.safe_walk`
-  / `resolve_within`; read only with `fs.read_public_text` (refuses non-`.pub`
-  before opening). No `open(` elsewhere in `src` — a test greps for it.
+  / `resolve_within`; read only with one of the three reader functions —
+  `fs.read_public_text` (refuses non-`.pub` before opening),
+  `fs.read_config_text` (one ssh_config(5) file), `fs.read_known_hosts_text`
+  (one known_hosts(5) file, name- and root-checked before opening) — each the
+  single place its kind of file is opened. No `open(` elsewhere in `src` — a
+  test greps for it.
 - **Private-key trap.** An autouse guard in `tests/conftest.py` fails any test
   that reads a non-`.pub`, non-config file inside the synthetic HOME; the
   `fake_home` fixture plants `~/.ssh/id_canary` (bytes `CANARY-PRIVATE-7f3a`).
