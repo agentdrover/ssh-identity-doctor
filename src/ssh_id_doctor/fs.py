@@ -269,7 +269,10 @@ def read_known_hosts_text(
     try:
         file_mode = os.stat(real).st_mode
     except OSError as exc:
-        raise type(exc)(f"{normalized.name!r}: {exc.strerror or type(exc).__name__}") from exc
+        # `from None`, not `from exc`: chaining would keep the original OSError
+        # (whose stdlib __str__ embeds the full path via .filename) reachable
+        # from this exception's traceback, undoing the sanitized message above.
+        raise type(exc)(f"{normalized.name!r}: {exc.strerror or type(exc).__name__}") from None
     if not stat.S_ISREG(file_mode):
         raise NotAKnownHostsFile(f"{normalized.name!r} is not a regular file")
     # O_NONBLOCK: should the path be swapped for a FIFO after the check above,
@@ -278,7 +281,7 @@ def read_known_hosts_text(
     try:
         fd = os.open(real, flags)
     except OSError as exc:
-        raise type(exc)(f"{normalized.name!r}: {exc.strerror or type(exc).__name__}") from exc
+        raise type(exc)(f"{normalized.name!r}: {exc.strerror or type(exc).__name__}") from None
     with os.fdopen(fd, "rb") as handle:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
             raise NotAKnownHostsFile(f"{normalized.name!r} is not a regular file")

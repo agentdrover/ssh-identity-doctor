@@ -32,6 +32,22 @@ _WILDCARD_CHARS = ("*", "?")
 _BRACKET_PORT_RE = re.compile(r"^\[(.+)\]:(\d+)$")
 _DEFAULT_PORT = "22"
 
+
+def _exposes_plaintext_host(entry: KnownHostEntry) -> bool:
+    """True if at least one of the entry's host tokens is not hashed.
+
+    ``entry.hashed`` is set when *any* token is hashed (inspectors/known_hosts.py),
+    so a mixed line like ``|1|salt|hash,plain.example.com`` has ``hashed=True``
+    even though it also exposes a plaintext name; KHS001 needs the per-token
+    answer instead.
+    """
+    for token in entry.hosts:
+        candidate = token[1:] if token.startswith("!") else token
+        if not candidate.startswith("|1|"):
+            return True
+    return False
+
+
 _MALFORMED_KINDS: frozenset[str] = frozenset(
     {
         "unknown_marker",
@@ -98,7 +114,7 @@ class KHS001Rule:
 
         lines_by_file: dict[str, set[int]] = {}
         for entry in snapshot.known_hosts:
-            if entry.hashed:
+            if not _exposes_plaintext_host(entry):
                 continue
             lines_by_file.setdefault(entry.source_file, set()).add(entry.line)
 
@@ -167,7 +183,7 @@ class KHS002Rule:
             fp_map = groups[group_key]
             if len(fp_map) < 2:
                 continue
-            _, key_type = group_key
+            norm_host, key_type = group_key
 
             contributing = sorted(
                 (e for entries in fp_map.values() for e in entries),
@@ -179,11 +195,16 @@ class KHS002Rule:
             )
             affected_hosts = tuple(sorted(raw_tokens[group_key]))
             fingerprints = tuple(sorted(fp_map))
+            # norm_host is part of the id: two entries sharing one line can belong to
+            # several (host, key_type) groups at once (a line listing multiple hosts),
+            # so the same evidence/fingerprints/key_type would otherwise collide across
+            # groups that differ only by which host they're keyed on.
             fid = rules_pkg.finding_id(
                 self.rule_id,
                 evidence=evidence,
                 fingerprints=fingerprints,
                 key_type=key_type,
+                host=norm_host,
             )
 
             host_label = affected_hosts[0]

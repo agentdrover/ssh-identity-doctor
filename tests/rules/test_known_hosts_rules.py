@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from conftest import OpenGuard
 from ssh_id_doctor.domain import (
     Confidence,
     CoverageState,
@@ -116,6 +117,26 @@ def test_khs_rules_fire_and_silent() -> None:
     )
     assert KHS001.evaluate(snap_hashed_only) == []
 
+    # a line mixing a hashed token with a plaintext host still fires: `entry.hashed`
+    # is True whenever *any* token is hashed, so checking it alone would miss the
+    # plaintext name sharing the line (review finding, gen1).
+    snap_mixed_hosts = _make_snapshot(
+        sources=available,
+        known_hosts=(
+            _entry(
+                line=1,
+                hosts=(
+                    "|1|AAECAwQFBgcICQoLDA0ODxAREhM=|FBUWFxgZGhscHR4fICEiIyQlJic=",
+                    "plain.example.com",
+                ),
+                hashed=True,
+            ),
+        ),
+    )
+    findings = KHS001.evaluate(snap_mixed_hosts)
+    assert len(findings) == 1
+    assert findings[0].evidence[0].line == 1
+
     # --- KHS002: one host, two fingerprints of the same key type -> fires ---
     snap_conflict = _make_snapshot(
         sources=available,
@@ -221,6 +242,25 @@ def test_khs_rules_fire_and_silent() -> None:
     )
     assert KHS002.evaluate(snap_pattern) == []
 
+    # a line listing two hosts conflicts on both: each host gets its own finding
+    # with its own id, not collapsed into one (review finding, gen1 — the id
+    # omitted the normalized host, so two groups sharing the same contributing
+    # entries/evidence/fingerprints/key_type produced identical ids).
+    snap_multi_host_conflict = _make_snapshot(
+        sources=available,
+        known_hosts=(
+            _entry(line=1, hosts=("a.example.com", "b.example.com"), fingerprint=_FP_A),
+            _entry(line=2, hosts=("a.example.com", "b.example.com"), fingerprint=_FP_B),
+        ),
+    )
+    findings = KHS002.evaluate(snap_multi_host_conflict)
+    assert len(findings) == 2
+    assert len({f.id for f in findings}) == 2
+    assert {f.affected_hosts for f in findings} == {
+        ("a.example.com",),
+        ("b.example.com",),
+    }
+
     # --- KHS003: fires on ssh-dss, silent otherwise ---
     snap_dss = _make_snapshot(
         sources=available,
@@ -294,14 +334,28 @@ def test_khs_rules_fire_and_silent() -> None:
     # --- coverage gating: unavailable/empty/skipped/timeout/absent silence every KHS rule ---
     rule_objects = (KHS001, KHS002, KHS003, KHS004, KHS005, KHS006)
     triggering_entries = (
+        # Same host, same key type, different fingerprint: on its own this also
+        # triggers KHS002 (not just KHS001), so the gating check below is not
+        # vacuous for KHS002 either.
         _entry(line=1, hosts=("dup.example.com",), fingerprint=_FP_A),
-        _entry(line=2, hosts=("dup.example.com",), fingerprint=_FP_B, key_type="ssh-dss"),
-        _entry(line=3, hosts=("ca.example.com",), marker="cert-authority"),
-        _entry(line=4, hosts=("rsa.example.com",), key_type="ssh-rsa"),
+        _entry(line=2, hosts=("dup.example.com",), fingerprint=_FP_B),
+        _entry(line=3, hosts=("dss.example.com",), key_type="ssh-dss"),
+        _entry(line=4, hosts=("ca.example.com",), marker="cert-authority"),
+        _entry(line=5, hosts=("rsa.example.com",), key_type="ssh-rsa"),
     )
     triggering_unresolved = (
         UnresolvedItem(kind="incomplete_line", detail="", source_file=_SOURCE_FILE, source_line=9),
     )
+
+    # Sanity check: with coverage available, these same entries fire every rule,
+    # so the gating loop below actually proves gating silences them (not that
+    # they were already silent for unrelated reasons).
+    snap_sanity = _make_snapshot(
+        sources=available, known_hosts=triggering_entries, unresolved=triggering_unresolved
+    )
+    for rule in rule_objects:
+        assert rule.evaluate(snap_sanity), f"{rule.rule_id} unexpectedly silent with coverage"
+
     for state in (
         CoverageState.UNAVAILABLE,
         CoverageState.EMPTY,
@@ -325,7 +379,68 @@ def test_khs_rules_fire_and_silent() -> None:
         assert rule.evaluate(snap_no_coverage) == [], f"{rule.rule_id} fired without coverage"
 
 
-def test_khs_ids_stable_across_homes(tmp_path: Path) -> None:
+def test_khs_evidence_counts_and_wording() -> None:
+    """Review finding (test gap): the fire/silent test never pinned down the
+    KHS001 evidence cap, the exact line numbers KHS004/KHS005 report, or KHS006's
+    wording, so a mutation widening the cap or dropping a line would pass."""
+    available = (_cov(CoverageState.AVAILABLE),)
+
+    # KHS001: evidence is capped at 20 lines even though more are unhashed, and
+    # the summary still reports the real (uncapped) count.
+    many_entries = tuple(_entry(line=n, hosts=(f"host{n}.example.com",)) for n in range(1, 26))
+    snap_many = _make_snapshot(sources=available, known_hosts=many_entries)
+    findings = KHS001.evaluate(snap_many)
+    assert len(findings) == 1
+    assert [ev.line for ev in findings[0].evidence] == list(range(1, 21))
+    assert "25 known_hosts line(s)" in findings[0].summary
+
+    # KHS004: evidence lists exactly the marked lines, in order, excluding the
+    # unmarked one; the summary count matches.
+    snap_markers = _make_snapshot(
+        sources=available,
+        known_hosts=(
+            _entry(line=1, hosts=("a.example.com",), marker="revoked"),
+            _entry(line=2, hosts=("b.example.com",)),
+            _entry(line=3, hosts=("c.example.com",), marker="cert-authority"),
+        ),
+    )
+    findings = KHS004.evaluate(snap_markers)
+    assert len(findings) == 1
+    assert [ev.line for ev in findings[0].evidence] == [1, 3]
+    assert "2 line(s)" in findings[0].summary
+
+    # KHS005: evidence lists exactly the malformed lines, excluding an unresolved
+    # item from another source; the summary count matches.
+    snap_malformed_lines = _make_snapshot(
+        sources=(_cov(CoverageState.MALFORMED),),
+        unresolved=(
+            UnresolvedItem(
+                kind="incomplete_line", detail="", source_file=_SOURCE_FILE, source_line=5
+            ),
+            UnresolvedItem(
+                kind="invalid_base64", detail="", source_file=_SOURCE_FILE, source_line=9
+            ),
+            UnresolvedItem(kind="include_cycle", detail="", source_file="config", source_line=7),
+        ),
+    )
+    findings = KHS005.evaluate(snap_malformed_lines)
+    assert len(findings) == 1
+    assert [ev.line for ev in findings[0].evidence] == [5, 9]
+    assert "2 line(s)" in findings[0].summary
+
+    # KHS006: exact title and the rsa-sha2-256/512 wording the AC calls for.
+    snap_rsa = _make_snapshot(
+        sources=available,
+        known_hosts=(_entry(line=1, hosts=("rsa.example.com",), key_type="ssh-rsa"),),
+    )
+    findings = KHS006.evaluate(snap_rsa)
+    assert len(findings) == 1
+    assert findings[0].title == "known_hosts entry uses ssh-rsa"
+    assert "not unsafe" in findings[0].summary
+    assert "rsa-sha2-256/512" in findings[0].summary
+
+
+def test_khs_ids_stable_across_homes(tmp_path: Path, open_guard: OpenGuard) -> None:
     """AC-2: the same known_hosts fixture scanned under two different HOME roots
     produces identical KHS001-KHS006 finding ids (paths under HOME hash as '~/...')."""
     fixture_text = _FIXTURE.read_text()
@@ -350,6 +465,9 @@ def test_khs_ids_stable_across_homes(tmp_path: Path) -> None:
     home_b = tmp_path / "deeply" / "nested" / "home-b"
     home_a.mkdir()
     home_b.mkdir(parents=True)
+    # AGENTS.md: these two HOME roots are built outside fake_home/_isolated_home,
+    # so guard them explicitly or a private-key read here would go uncaught.
+    open_guard.guard_root(home_a, home_b)
 
     snap_a = _scan_under(home_a)
     snap_b = _scan_under(home_b)
