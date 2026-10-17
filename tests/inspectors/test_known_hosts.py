@@ -7,9 +7,7 @@ from pathlib import Path
 from ssh_id_doctor.domain import KnownHostEntry, UnresolvedItem
 from ssh_id_doctor.inspectors.known_hosts import parse_known_hosts
 
-FIXTURE = (
-    Path(__file__).resolve().parents[1] / "fixtures" / "known_hosts" / "grammar_cases.txt"
-)
+FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "known_hosts" / "grammar_cases.txt"
 
 _ED25519_FINGERPRINT = "SHA256:8z2Fpm6wsI4ebPXiQEZAY3BcDDx0XrSASx7FJsZkorg"
 _RSA_FINGERPRINT = "SHA256:fEkv9SCAR5/6nQG/lrL9hYk4yccNPFa5mtq+XXdeLMQ"
@@ -66,9 +64,7 @@ def test_parse_grammar_cases() -> None:
 
     hashed = entries_by_line[_line_of(lines, "valid-hashed-host")]
     assert hashed.hashed is True
-    assert hashed.hosts == (
-        "|1|AAECAwQFBgcICQoLDA0ODxAREhM=|FBUWFxgZGhscHR4fICEiIyQlJic=",
-    )
+    assert hashed.hosts == ("|1|AAECAwQFBgcICQoLDA0ODxAREhM=|FBUWFxgZGhscHR4fICEiIyQlJic=",)
     assert hashed.fingerprint == _ED25519_FINGERPRINT
 
     ecdsa = entries_by_line[_line_of(lines, "valid-ecdsa")]
