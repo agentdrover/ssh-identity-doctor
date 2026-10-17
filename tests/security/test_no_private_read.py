@@ -89,12 +89,15 @@ def test_src_has_no_direct_subprocess_or_open() -> None:
 
 
 def _imported_module_names(tree: ast.AST) -> set[str]:
+    """Every module an import statement reaches, including `from pkg import submodule`
+    (which binds a name but also pulls in `pkg.submodule` as an importable module)."""
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             names.add(node.module)
+            names.update(f"{node.module}.{alias.name}" for alias in node.names)
     return names
 
 
