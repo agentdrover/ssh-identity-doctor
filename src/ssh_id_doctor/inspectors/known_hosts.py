@@ -121,7 +121,7 @@ def _parse_hosts_field(field: str) -> tuple[str, ...] | None:
         candidate = item[1:] if item.startswith("!") else item
         if not candidate:
             return None
-        if candidate.startswith("|1|") and not _valid_hashed_token(candidate):
+        if candidate.startswith("|") and not _valid_hashed_token(candidate):
             return None
         parsed.append(item)
     return tuple(parsed)
@@ -191,11 +191,12 @@ def _parse_line(line: str, lineno: int, source_file: str) -> KnownHostEntry | Un
     marker: str | None = None
     rest = line
     if rest.startswith("@"):
-        token, _, remainder = rest.partition(" ")
+        marker_parts = rest.split(None, 1)
+        token = marker_parts[0]
         if token not in _MARKERS:
             return _bad(source_file, lineno, "unknown_marker")
         marker = _MARKERS[token]
-        rest = remainder.strip()
+        rest = marker_parts[1].strip() if len(marker_parts) > 1 else ""
         if not rest:
             return _bad(source_file, lineno, "missing_hosts_field")
 

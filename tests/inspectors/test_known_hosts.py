@@ -13,6 +13,13 @@ _ED25519_FINGERPRINT = "SHA256:8z2Fpm6wsI4ebPXiQEZAY3BcDDx0XrSASx7FJsZkorg"
 _RSA_FINGERPRINT = "SHA256:fEkv9SCAR5/6nQG/lrL9hYk4yccNPFa5mtq+XXdeLMQ"
 _ECDSA_FINGERPRINT = "SHA256:16kaGO4v0U+U3KqxCkcm4fOFE7TA7wQOx5r1xHg47o4"
 _UNKNOWN_ALGO_FINGERPRINT = "SHA256:c8yjN2G0xcy+BAw3rlf8ghp/H6nhuPdN9csNr8cJfwA"
+# ssh-dss/sk-* blobs are hand-built wire data (see review finding #3, gen 1): this
+# OpenSSH no longer supports `ssh-keygen -t dsa`, and the sk-* types need a FIDO
+# device, so there is no `ssh-keygen -lf` oracle for these fingerprints the way
+# there is for ed25519/rsa/ecdsa above (AC-3 only requires exact match for those).
+_DSS_FINGERPRINT = "SHA256:VKT/P9mp/6KevW1/lzN5Hmt5QXjkw8wnxMfKIRIl4x4"
+_SK_ED25519_FINGERPRINT = "SHA256:D76+rwBygonZjZTPNsf/Md9iFJqkkHTOTDIITHjZXqU"
+_SK_ECDSA_FINGERPRINT = "SHA256:iwGBaL9pwyWKtjyYYWoZLrTbxmSAPezKbLlkquwT8Pw"
 
 
 def _line_of(lines: list[str], marker: str) -> int:
@@ -75,6 +82,25 @@ def test_parse_grammar_cases() -> None:
     assert unknown_algo.key_type == "ssh-unknown-type"
     assert unknown_algo.fingerprint == _UNKNOWN_ALGO_FINGERPRINT
 
+    dss = entries_by_line[_line_of(lines, "valid-dss")]
+    assert dss.key_type == "ssh-dss"
+    assert dss.fingerprint == _DSS_FINGERPRINT
+
+    sk_ed25519 = entries_by_line[_line_of(lines, "valid-sk-ed25519")]
+    assert sk_ed25519.key_type == "sk-ssh-ed25519@openssh.com"
+    assert sk_ed25519.fingerprint == _SK_ED25519_FINGERPRINT
+
+    sk_ecdsa = entries_by_line[_line_of(lines, "valid-sk-ecdsa")]
+    assert sk_ecdsa.key_type == "sk-ecdsa-sha2-nistp256@openssh.com"
+    assert sk_ecdsa.fingerprint == _SK_ECDSA_FINGERPRINT
+
+    # Review finding #1794 gen1 (medium, inspectors/known_hosts.py:194): the marker
+    # token must split on any whitespace, not just a literal space, so a TAB
+    # between '@revoked' and the hosts field is still a valid marker.
+    revoked_tab = entries_by_line[_line_of(lines, "valid-revoked-marker-tab")]
+    assert revoked_tab.marker == "revoked"
+    assert revoked_tab.hosts == ("revoked-tab.example.com",)
+
     # --- broken lines: UnresolvedItem, no quoted line content ---
 
     bad_markers = {
@@ -85,6 +111,13 @@ def test_parse_grammar_cases() -> None:
         "bad-blob-extra-bytes": "invalid_key_blob",
         "bad-base64": "invalid_base64",
         "bad-hosts-field": "invalid_hosts_field",
+        # Review finding #1794 gen1 (medium, inspectors/known_hosts.py:124): a host
+        # item starting with '|' that is not a strictly valid |1|salt|hash token
+        # (here |2|...) must be malformed, not accepted as a literal hostname.
+        "bad-non-hash1-pipe-token": "invalid_hosts_field",
+        "bad-blob-dss-missing-mpint": "invalid_key_blob",
+        "bad-blob-sk-ed25519-short-point": "invalid_key_blob",
+        "bad-blob-sk-ecdsa-mismatched-curve": "invalid_key_blob",
     }
     for comment, expected_kind in bad_markers.items():
         lineno = _line_of(lines, comment)

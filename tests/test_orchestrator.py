@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from ssh_id_doctor.domain import (
     SourceCoverage,
 )
 from ssh_id_doctor.inspectors.agent import AgentResult, AgentState
+from ssh_id_doctor.inspectors.keygen import KeyInfo, PublicKeyInspector
 from ssh_id_doctor.orchestrator import OrchestratorOptions, ScanOrchestrator
 from ssh_id_doctor.rules import finding_id
 
@@ -463,6 +465,84 @@ def test_known_hosts_coverage_states(
     capsys.readouterr()
 
     assert open_guard.violations == []
+
+
+def test_no_known_hosts_flag_reaches_all_three_cli_commands(
+    home_basic_setup: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Review finding #1794 gen1 (medium, test gap): AC-4's spy proves
+    --no-known-hosts reaches ``OrchestratorOptions``, but nothing drove it through
+    argparse end-to-end for the three commands that expose it (scan, rotation-plan,
+    explain). Spy on ``fs.read_known_hosts_text`` itself and run each command
+    through ``main()`` with and without the flag."""
+    ssh = home_basic_setup / ".ssh"
+    config = ssh / "config"
+    known_hosts = ssh / "known_hosts"
+    known_hosts.write_text(
+        "example.com ssh-ed25519 "
+        "AAAAC3NzaC1lZDI1NTE5AAAAIMwKQfiW86Yu6eXH3bYIk94OnoidaKLausFeWb3nT/iL\n"
+    )
+
+    import ssh_id_doctor.fs as fs_module
+
+    calls: list[object] = []
+    original = fs_module.read_known_hosts_text
+    monkeypatch.setattr(
+        fs_module,
+        "read_known_hosts_text",
+        lambda *a, **kw: calls.append((a, kw)) or original(*a, **kw),
+    )
+
+    base_args = ["--no-agent", "--ssh-dir", str(ssh), "--config", str(config)]
+
+    # scan
+    calls.clear()
+    rc = main(["scan", "--format", "json", "--no-known-hosts", *base_args])
+    capsys.readouterr()
+    assert rc == 0
+    assert calls == []
+
+    calls.clear()
+    rc = main(["scan", "--format", "json", *base_args])
+    data = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert calls != []
+    finding_ids = [f["id"] for f in data["findings"]]
+
+    # rotation-plan
+    keygen = PublicKeyInspector()
+    info = keygen.fingerprint((ssh / "id_ed25519.pub").read_text())
+    assert isinstance(info, KeyInfo)
+
+    calls.clear()
+    rc = main(["rotation-plan", info.fingerprint, "--format", "md", "--no-known-hosts", *base_args])
+    capsys.readouterr()
+    assert rc == 0
+    assert calls == []
+
+    calls.clear()
+    rc = main(["rotation-plan", info.fingerprint, "--format", "md", *base_args])
+    capsys.readouterr()
+    assert rc == 0
+    assert calls != []
+
+    # explain
+    assert finding_ids, "scan must have produced at least one finding to explain"
+    target_finding_id = finding_ids[0]
+
+    calls.clear()
+    rc = main(["explain", target_finding_id, "--format", "md", "--no-known-hosts", *base_args])
+    capsys.readouterr()
+    assert rc == 0
+    assert calls == []
+
+    calls.clear()
+    rc = main(["explain", target_finding_id, "--format", "md", *base_args])
+    capsys.readouterr()
+    assert rc == 0
+    assert calls != []
 
 
 def test_finding_ids_do_not_depend_on_the_scanned_home_root(

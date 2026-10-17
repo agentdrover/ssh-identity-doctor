@@ -10,6 +10,7 @@ from __future__ import annotations
 import builtins
 import io
 import os
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -193,3 +194,96 @@ def test_read_known_hosts_text_refusals(tmp_path: Path, opened_paths: list[str])
     # Missing file is a distinct FileNotFoundError, not a refusal.
     with pytest.raises(FileNotFoundError):
         fs.read_known_hosts_text(ssh_dir / "known_hosts", ssh_dir=ssh_dir)
+
+
+def test_read_known_hosts_text_open_uses_nofollow_nonblock_cloexec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding #1794 gen1 (medium, test gap): a regression test that would
+    catch dropping O_NOFOLLOW/O_NONBLOCK/O_CLOEXEC from the real ``os.open`` call
+    in :func:`read_known_hosts_text` (AC-1's existing refusal tests only exercise
+    the *earlier*, pure-Python checks and never look at the flags passed to the
+    syscall itself)."""
+    ssh_dir = tmp_path / "ssh"
+    ssh_dir.mkdir()
+    target = ssh_dir / "known_hosts"
+    target.write_text("example.com ssh-ed25519 AAAA\n")
+
+    captured_flags: list[int] = []
+    real_open = os.open
+
+    def recording_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        captured_flags.append(flags)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", recording_open)
+
+    fs.read_known_hosts_text(target, ssh_dir=ssh_dir)
+
+    assert captured_flags, "read_known_hosts_text must call os.open"
+    flags = captured_flags[-1]
+    assert flags & os.O_NOFOLLOW
+    assert flags & os.O_NONBLOCK
+    assert flags & os.O_CLOEXEC
+
+
+def test_read_known_hosts_text_fstat_refuses_fifo_even_if_the_prior_stat_lied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding #1794 gen1 (medium, test gap): a regression test for the
+    ``fstat``-after-``open`` check, which today's AC-1 FIFO case never reaches
+    (that FIFO is already named ``known_hosts`` and so is refused by the earlier,
+    pre-open ``os.stat`` check). Here the pre-open ``stat`` is made to report a
+    regular file for a target that is actually a FIFO — simulating it being
+    swapped out between the two checks — so only the ``fstat`` on the opened fd
+    can catch it; removing that check would make this read succeed instead of
+    raising."""
+    ssh_dir = tmp_path / "ssh"
+    ssh_dir.mkdir()
+    target = ssh_dir / "known_hosts"
+    os.mkfifo(target)
+    real_target = os.path.realpath(target)
+    real_stat = os.stat
+
+    class _RegularFileStat:
+        def __init__(self, real_result: os.stat_result) -> None:
+            self._real = real_result
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real, name)
+
+        @property
+        def st_mode(self) -> int:
+            return stat.S_IFREG | 0o644
+
+    def lying_stat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        result = real_stat(path, *args, **kwargs)
+        if os.fspath(path) == real_target:
+            return _RegularFileStat(result)
+        return result
+
+    monkeypatch.setattr(os, "stat", lying_stat)
+
+    with pytest.raises(NotAKnownHostsFile):
+        fs.read_known_hosts_text(target, ssh_dir=ssh_dir)
+
+
+def test_read_known_hosts_text_permission_error_names_only_the_base_name(
+    tmp_path: Path,
+) -> None:
+    """Review finding #1794 gen1 (low, fs.py:266): an ``OSError`` raised by the
+    ``stat``/``open`` syscalls themselves (unlike the function's own explicit
+    refusals) must not leak the full path either — the stdlib formats
+    ``PermissionError`` with the complete path by default."""
+    ssh_dir = tmp_path / "ssh"
+    ssh_dir.mkdir()
+    target = ssh_dir / "known_hosts"
+    target.write_text("example.com ssh-ed25519 AAAA\n")
+    target.chmod(0o000)
+    try:
+        with pytest.raises(PermissionError) as exc_info:
+            fs.read_known_hosts_text(target, ssh_dir=ssh_dir)
+        assert str(ssh_dir) not in str(exc_info.value)
+        assert "known_hosts" in str(exc_info.value)
+    finally:
+        target.chmod(0o600)

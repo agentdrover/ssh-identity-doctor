@@ -252,8 +252,11 @@ def read_known_hosts_text(
     (FIFO, socket, device). After reading, refuses content holding a
     private-key header on any line, or over ``max_bytes``, just like
     :func:`read_config_text`. The message names the file only by its base
-    name and never quotes file content. A missing file raises
-    ``FileNotFoundError``, distinct from a refusal.
+    name and never quotes file content — including an ``OSError`` raised by
+    the ``stat``/``open`` syscalls themselves (e.g. :class:`PermissionError`),
+    which the stdlib would otherwise format with the full path; those are
+    re-raised with the same exception type but a sanitized message. A
+    missing file raises ``FileNotFoundError``, distinct from a refusal.
     """
     normalized = _normalize(path)
     if normalized.name != KNOWN_HOSTS_NAME:
@@ -263,12 +266,20 @@ def read_known_hosts_text(
         raise FileNotFoundError(f"{normalized.name!r} not found")
     if resolution is not Resolution.RESOLVED or real.name != KNOWN_HOSTS_NAME:
         raise NotAKnownHostsFile(f"{normalized.name!r} is outside the ssh directory")
-    if not stat.S_ISREG(os.stat(real).st_mode):
+    try:
+        file_mode = os.stat(real).st_mode
+    except OSError as exc:
+        raise type(exc)(f"{normalized.name!r}: {exc.strerror or type(exc).__name__}") from exc
+    if not stat.S_ISREG(file_mode):
         raise NotAKnownHostsFile(f"{normalized.name!r} is not a regular file")
     # O_NONBLOCK: should the path be swapped for a FIFO after the check above,
     # the open still returns at once and the fstat below refuses it.
     flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
-    with os.fdopen(os.open(real, flags), "rb") as handle:
+    try:
+        fd = os.open(real, flags)
+    except OSError as exc:
+        raise type(exc)(f"{normalized.name!r}: {exc.strerror or type(exc).__name__}") from exc
+    with os.fdopen(fd, "rb") as handle:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
             raise NotAKnownHostsFile(f"{normalized.name!r} is not a regular file")
         data = handle.read(max_bytes + 1)
