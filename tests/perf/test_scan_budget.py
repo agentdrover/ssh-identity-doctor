@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
+from conftest import CANARY_PRIVATE_KEY, OpenGuard
 from ssh_id_doctor.domain import CoverageState
 from ssh_id_doctor.orchestrator import OrchestratorOptions, ScanOrchestrator
 
@@ -51,6 +54,23 @@ def test_the_generator_builds_exactly_the_declared_home(perf_home: PerfHomeFixtu
         f"Expected exactly 500 Host blocks parsed, found {len(doc.host_blocks)}"
     )
     assert perf_home.num_host_blocks == 500
+
+
+def test_perf_home_is_guarded(perf_home: PerfHomeFixture, open_guard: OpenGuard) -> None:
+    """#1836: perf_home registers its HOME with open_guard.guard_root in the fixture
+    (tests/perf/conftest.py) since _private_open_guard already captured the original
+    HOME before perf_home swaps it. ``id_canary`` is planted here, not inside the
+    fixture itself, so it does not trip
+    test_the_generator_builds_exactly_the_declared_home's private-key-free check above.
+    A guard that doesn't cover perf_home's HOME would let this read through silently."""
+    private = perf_home.home / ".ssh" / "id_canary"
+    private.write_text(CANARY_PRIVATE_KEY)
+
+    with pytest.raises(AssertionError):
+        private.read_text()
+
+    assert len(open_guard.violations) == 1
+    open_guard.violations.clear()
 
 
 def test_scan_of_100_identities_and_500_entries_fits_the_budget(
