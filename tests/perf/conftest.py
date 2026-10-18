@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import OpenGuard
 from ssh_id_doctor.inspectors.agent import AgentResult, AgentState
 from ssh_id_doctor.inspectors.keygen import KeyInfo
 
@@ -87,10 +88,18 @@ class PerfHomeFixture:
 
 
 @pytest.fixture
-def perf_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[PerfHomeFixture]:
-    """Generate synthetic HOME in tmp_path with 100 .pub files and 500 config Host blocks."""
+def perf_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, open_guard: OpenGuard
+) -> Iterator[PerfHomeFixture]:
+    """Generate synthetic HOME in tmp_path with 100 .pub files and 500 config Host blocks.
+
+    ``_private_open_guard`` (tests/conftest.py) records the original HOME before this
+    fixture swaps HOME to a sibling directory in ``tmp_path``; without registering that
+    new directory via ``guard_root``, a private-file read inside it would go uncaught.
+    """
     home = tmp_path / "perf_home"
     home.mkdir()
+    open_guard.guard_root(home)
     ssh_dir = home / ".ssh"
     ssh_dir.mkdir(mode=0o700)
     config_d = ssh_dir / "config.d"

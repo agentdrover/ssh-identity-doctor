@@ -49,6 +49,21 @@ def _snapshot(root: Path) -> dict[str, tuple[int, int]]:
     return {str(p): (p.lstat().st_mode, p.lstat().st_mtime_ns) for p in sorted(root.rglob("*"))}
 
 
+@pytest.fixture
+def guarded_ssh_dir(tmp_path: Path, open_guard: OpenGuard) -> Path:
+    """A fresh ssh_dir under tmp_path, registered via ``open_guard.guard_root``.
+
+    AGENTS.md: a fixture built outside fake_home must guard_root() explicitly. Shared
+    by the two traceback tests below and by test_traceback_fixture_is_guarded, so that
+    proof test actually exercises the same registration those two tests rely on (#1836)
+    instead of only proving the mechanism works on a directory of its own.
+    """
+    ssh_dir = tmp_path / "ssh"
+    ssh_dir.mkdir()
+    open_guard.guard_root(ssh_dir)
+    return ssh_dir
+
+
 def test_safe_walk_does_not_follow_symlink_outside_root(
     fake_home: Path, tmp_path: Path, opened_paths: list[str]
 ) -> None:
@@ -302,7 +317,7 @@ def test_read_known_hosts_text_permission_error_names_only_the_base_name(
 
 
 def test_read_known_hosts_text_permission_error_does_not_leak_path_via_traceback(
-    tmp_path: Path, open_guard: OpenGuard
+    guarded_ssh_dir: Path,
 ) -> None:
     """Review finding (low, fs.py:272/281): the stat/open ``OSError`` was re-raised
     with ``from exc``, so the original, path-carrying exception stayed reachable as
@@ -313,10 +328,7 @@ def test_read_known_hosts_text_permission_error_does_not_leak_path_via_traceback
     execute on the containing directories), so this exercises the *second*
     ``except OSError`` branch (around ``os.open``); the ``os.stat`` branch has
     its own regression test below."""
-    ssh_dir = tmp_path / "ssh"
-    ssh_dir.mkdir()
-    # AGENTS.md: a fixture built outside fake_home must guard_root() explicitly.
-    open_guard.guard_root(ssh_dir)
+    ssh_dir = guarded_ssh_dir
     target = ssh_dir / "known_hosts"
     target.write_text("example.com ssh-ed25519 AAAA\n")
     target.chmod(0o000)
@@ -336,7 +348,7 @@ def test_read_known_hosts_text_permission_error_does_not_leak_path_via_traceback
 
 
 def test_stat_error_traceback_has_no_full_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, open_guard: OpenGuard
+    guarded_ssh_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC-1 (#1833): the test above only reaches the ``except OSError`` branch
     around ``os.open`` — chmod 0o000 blocks ``open`` but not ``stat``. The
@@ -345,10 +357,7 @@ def test_stat_error_traceback_has_no_full_path(
     monkeypatches ``os.stat`` itself to raise, forcing that first branch.
     Dropping its ``from None`` would keep the original, path-carrying OSError
     reachable as ``__cause__`` and visible in a rendered traceback."""
-    ssh_dir = tmp_path / "ssh"
-    ssh_dir.mkdir()
-    # AGENTS.md: a fixture built outside fake_home must guard_root() explicitly.
-    open_guard.guard_root(ssh_dir)
+    ssh_dir = guarded_ssh_dir
     target = ssh_dir / "known_hosts"
     target.write_text("example.com ssh-ed25519 AAAA\n")
     real_target = os.path.realpath(target)
@@ -373,19 +382,16 @@ def test_stat_error_traceback_has_no_full_path(
     assert str(target) not in rendered
 
 
-def test_traceback_fixture_is_guarded(tmp_path: Path, open_guard: OpenGuard) -> None:
-    """AC-3 (#1833): the two tests above build their SSH directory on
-    ``tmp_path`` rather than ``fake_home`` — acceptable under AGENTS.md only
-    because they register it with ``open_guard.guard_root``, which is supposed
-    to extend the very same private-file protection ``fake_home`` gets. Prove
-    the registration actually works: a deliberate read of a private-key file
-    inside such a directory must be caught by the guard, exactly as it would
-    be inside ``fake_home`` — a guard that silently no-ops here would let this
-    violation through."""
-    ssh_dir = tmp_path / "ssh"
-    ssh_dir.mkdir()
-    open_guard.guard_root(ssh_dir)
-    private = ssh_dir / "id_canary"
+def test_traceback_fixture_is_guarded(guarded_ssh_dir: Path, open_guard: OpenGuard) -> None:
+    """AC-3 (#1833), AC-2 (#1836): the two tests above build their SSH directory via
+    the shared ``guarded_ssh_dir`` fixture, which is acceptable under AGENTS.md only
+    because that fixture registers it with ``open_guard.guard_root``, supposed to
+    extend the very same private-file protection ``fake_home`` gets. Prove the
+    registration actually works on the exact fixture those two tests depend on: a
+    deliberate read of a private-key file inside it must be caught by the guard —
+    a guard that silently no-ops here would let this violation through, and would
+    equally let it through for the two traceback tests above."""
+    private = guarded_ssh_dir / "id_canary"
     private.write_text(CANARY_PRIVATE_KEY)
 
     # AssertionError, not the more specific PrivateReadAttempt: a second,
