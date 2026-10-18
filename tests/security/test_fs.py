@@ -203,7 +203,7 @@ def test_read_known_hosts_text_refusals(
 
 
 def test_read_known_hosts_text_open_uses_nofollow_nonblock_cloexec(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, open_guard: OpenGuard
 ) -> None:
     """Review finding #1794 gen1 (medium, test gap): a regression test that would
     catch dropping O_NOFOLLOW/O_NONBLOCK/O_CLOEXEC from the real ``os.open`` call
@@ -212,6 +212,8 @@ def test_read_known_hosts_text_open_uses_nofollow_nonblock_cloexec(
     syscall itself)."""
     ssh_dir = tmp_path / "ssh"
     ssh_dir.mkdir()
+    # AGENTS.md: a fixture built outside fake_home must guard_root() explicitly.
+    open_guard.guard_root(ssh_dir)
     target = ssh_dir / "known_hosts"
     target.write_text("example.com ssh-ed25519 AAAA\n")
 
@@ -234,7 +236,7 @@ def test_read_known_hosts_text_open_uses_nofollow_nonblock_cloexec(
 
 
 def test_read_known_hosts_text_fstat_refuses_fifo_even_if_the_prior_stat_lied(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, open_guard: OpenGuard
 ) -> None:
     """Review finding #1794 gen1 (medium, test gap): a regression test for the
     ``fstat``-after-``open`` check, which today's AC-1 FIFO case never reaches
@@ -246,6 +248,8 @@ def test_read_known_hosts_text_fstat_refuses_fifo_even_if_the_prior_stat_lied(
     raising."""
     ssh_dir = tmp_path / "ssh"
     ssh_dir.mkdir()
+    # AGENTS.md: a fixture built outside fake_home must guard_root() explicitly.
+    open_guard.guard_root(ssh_dir)
     target = ssh_dir / "known_hosts"
     os.mkfifo(target)
     real_target = os.path.realpath(target)
@@ -275,7 +279,7 @@ def test_read_known_hosts_text_fstat_refuses_fifo_even_if_the_prior_stat_lied(
 
 
 def test_read_known_hosts_text_permission_error_names_only_the_base_name(
-    tmp_path: Path,
+    tmp_path: Path, open_guard: OpenGuard
 ) -> None:
     """Review finding #1794 gen1 (low, fs.py:266): an ``OSError`` raised by the
     ``stat``/``open`` syscalls themselves (unlike the function's own explicit
@@ -283,6 +287,8 @@ def test_read_known_hosts_text_permission_error_names_only_the_base_name(
     ``PermissionError`` with the complete path by default."""
     ssh_dir = tmp_path / "ssh"
     ssh_dir.mkdir()
+    # AGENTS.md: a fixture built outside fake_home must guard_root() explicitly.
+    open_guard.guard_root(ssh_dir)
     target = ssh_dir / "known_hosts"
     target.write_text("example.com ssh-ed25519 AAAA\n")
     target.chmod(0o000)
@@ -296,14 +302,21 @@ def test_read_known_hosts_text_permission_error_names_only_the_base_name(
 
 
 def test_read_known_hosts_text_permission_error_does_not_leak_path_via_traceback(
-    tmp_path: Path,
+    tmp_path: Path, open_guard: OpenGuard
 ) -> None:
     """Review finding (low, fs.py:272/281): the stat/open ``OSError`` was re-raised
     with ``from exc``, so the original, path-carrying exception stayed reachable as
     ``__cause__`` and would still appear — full path and all — in a printed
-    traceback, even though the new exception's own message is sanitized."""
+    traceback, even though the new exception's own message is sanitized.
+
+    Permissions 0o000 deny ``os.open`` but not ``os.stat`` (stat only needs
+    execute on the containing directories), so this exercises the *second*
+    ``except OSError`` branch (around ``os.open``); the ``os.stat`` branch has
+    its own regression test below."""
     ssh_dir = tmp_path / "ssh"
     ssh_dir.mkdir()
+    # AGENTS.md: a fixture built outside fake_home must guard_root() explicitly.
+    open_guard.guard_root(ssh_dir)
     target = ssh_dir / "known_hosts"
     target.write_text("example.com ssh-ed25519 AAAA\n")
     target.chmod(0o000)
@@ -320,3 +333,68 @@ def test_read_known_hosts_text_permission_error_does_not_leak_path_via_traceback
         assert str(target) not in rendered
     finally:
         target.chmod(0o600)
+
+
+def test_stat_error_traceback_has_no_full_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, open_guard: OpenGuard
+) -> None:
+    """AC-1 (#1833): the test above only reaches the ``except OSError`` branch
+    around ``os.open`` — chmod 0o000 blocks ``open`` but not ``stat``. The
+    branch around the earlier ``os.stat(real).st_mode`` call (fs.py) has its
+    own ``from None`` rollback that no existing test exercised; this
+    monkeypatches ``os.stat`` itself to raise, forcing that first branch.
+    Dropping its ``from None`` would keep the original, path-carrying OSError
+    reachable as ``__cause__`` and visible in a rendered traceback."""
+    ssh_dir = tmp_path / "ssh"
+    ssh_dir.mkdir()
+    # AGENTS.md: a fixture built outside fake_home must guard_root() explicitly.
+    open_guard.guard_root(ssh_dir)
+    target = ssh_dir / "known_hosts"
+    target.write_text("example.com ssh-ed25519 AAAA\n")
+    real_target = os.path.realpath(target)
+    real_stat = os.stat
+
+    def failing_stat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if os.fspath(path) == real_target:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", failing_stat)
+
+    with pytest.raises(PermissionError) as exc_info:
+        fs.read_known_hosts_text(target, ssh_dir=ssh_dir)
+    assert exc_info.value.__cause__ is None
+    rendered = "".join(
+        traceback.format_exception(
+            type(exc_info.value), exc_info.value, exc_info.value.__traceback__
+        )
+    )
+    assert str(ssh_dir) not in rendered
+    assert str(target) not in rendered
+
+
+def test_traceback_fixture_is_guarded(tmp_path: Path, open_guard: OpenGuard) -> None:
+    """AC-3 (#1833): the two tests above build their SSH directory on
+    ``tmp_path`` rather than ``fake_home`` — acceptable under AGENTS.md only
+    because they register it with ``open_guard.guard_root``, which is supposed
+    to extend the very same private-file protection ``fake_home`` gets. Prove
+    the registration actually works: a deliberate read of a private-key file
+    inside such a directory must be caught by the guard, exactly as it would
+    be inside ``fake_home`` — a guard that silently no-ops here would let this
+    violation through."""
+    ssh_dir = tmp_path / "ssh"
+    ssh_dir.mkdir()
+    open_guard.guard_root(ssh_dir)
+    private = ssh_dir / "id_canary"
+    private.write_text(CANARY_PRIVATE_KEY)
+
+    # AssertionError, not the more specific PrivateReadAttempt: a second,
+    # same-named conftest.py (tests/e2e/conftest.py) defines its own
+    # PrivateReadAttempt subclass, and pytest's rootdir-relative "conftest"
+    # import can resolve to either one — matching on the shared base class
+    # is the same idiom tests/security/test_no_private_read.py uses.
+    with pytest.raises(AssertionError):
+        private.read_text()
+
+    assert len(open_guard.violations) == 1
+    open_guard.violations.clear()  # deliberate violation; do not fail teardown
