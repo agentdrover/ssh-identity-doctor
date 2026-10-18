@@ -19,6 +19,7 @@ from ssh_id_doctor.rules import (
     algo_registry_rules,
     config_rules,
     identity_rules,
+    known_hosts_rules,
 )
 
 
@@ -102,7 +103,13 @@ def finding_id(
 def get_default_rules() -> list[Rule]:
     """Return all rules registered across all rule modules."""
     rules: list[Rule] = []
-    for mod in (config_rules, identity_rules, agent_rules, algo_registry_rules):
+    for mod in (
+        config_rules,
+        identity_rules,
+        agent_rules,
+        algo_registry_rules,
+        known_hosts_rules,
+    ):
         mod_rules = getattr(mod, "RULES", None)
         if isinstance(mod_rules, Iterable):
             rules.extend(mod_rules)

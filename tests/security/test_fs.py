@@ -11,12 +11,13 @@ import builtins
 import io
 import os
 import stat
+import traceback
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from conftest import CANARY, CANARY_PRIVATE_KEY
+from conftest import CANARY, CANARY_PRIVATE_KEY, OpenGuard
 from ssh_id_doctor import fs
 from ssh_id_doctor.domain import Resolution
 from ssh_id_doctor.fs import NotAConfigFile, NotAKnownHostsFile, PrivateKeyAccessDenied
@@ -113,7 +114,9 @@ def test_read_config_text_refuses_oversize_and_private_material(tmp_path: Path) 
     assert CANARY not in str(leaked.value)
 
 
-def test_read_known_hosts_text_refusals(tmp_path: Path, opened_paths: list[str]) -> None:
+def test_read_known_hosts_text_refusals(
+    tmp_path: Path, opened_paths: list[str], open_guard: OpenGuard
+) -> None:
     """AC-1: every unsafe known_hosts path is refused before any open (name not
     known_hosts; a known_hosts symlink to a differently named file; a known_hosts
     symlink to a known_hosts file outside ssh_dir; ssh_dir/sub a symlink to an
@@ -124,6 +127,9 @@ def test_read_known_hosts_text_refusals(tmp_path: Path, opened_paths: list[str])
     ssh_dir.mkdir()
     outside = tmp_path / "outside"
     outside.mkdir()
+    # AGENTS.md: fixtures built outside fake_home must guard_root() explicitly,
+    # so a private-key read here still fails the test via open_guard's teardown.
+    open_guard.guard_root(ssh_dir, outside)
     valid_line = "example.com ssh-ed25519 AAAA\n"
 
     # 1. name is not known_hosts.
@@ -285,5 +291,32 @@ def test_read_known_hosts_text_permission_error_names_only_the_base_name(
             fs.read_known_hosts_text(target, ssh_dir=ssh_dir)
         assert str(ssh_dir) not in str(exc_info.value)
         assert "known_hosts" in str(exc_info.value)
+    finally:
+        target.chmod(0o600)
+
+
+def test_read_known_hosts_text_permission_error_does_not_leak_path_via_traceback(
+    tmp_path: Path,
+) -> None:
+    """Review finding (low, fs.py:272/281): the stat/open ``OSError`` was re-raised
+    with ``from exc``, so the original, path-carrying exception stayed reachable as
+    ``__cause__`` and would still appear — full path and all — in a printed
+    traceback, even though the new exception's own message is sanitized."""
+    ssh_dir = tmp_path / "ssh"
+    ssh_dir.mkdir()
+    target = ssh_dir / "known_hosts"
+    target.write_text("example.com ssh-ed25519 AAAA\n")
+    target.chmod(0o000)
+    try:
+        with pytest.raises(PermissionError) as exc_info:
+            fs.read_known_hosts_text(target, ssh_dir=ssh_dir)
+        assert exc_info.value.__cause__ is None
+        rendered = "".join(
+            traceback.format_exception(
+                type(exc_info.value), exc_info.value, exc_info.value.__traceback__
+            )
+        )
+        assert str(ssh_dir) not in rendered
+        assert str(target) not in rendered
     finally:
         target.chmod(0o600)

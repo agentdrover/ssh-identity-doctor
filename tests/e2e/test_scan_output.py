@@ -15,6 +15,7 @@ from ssh_id_doctor.exit_codes import ExitCode
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_PATH = REPO_ROOT / "src" / "ssh_id_doctor" / "reporting" / "schema" / "scan-1.0.json"
+_KHS_FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "known_hosts" / "khs_findings.txt"
 
 
 def test_output_atomic_0600_and_exit_4_keeps_old_report(
@@ -141,3 +142,60 @@ def test_known_hosts_json_schema(
     assert "known_hosts" not in data
     source_map = {s["source"]: s for s in data["sources"]}
     assert source_map["known_hosts"]["state"] == "available"
+
+
+def test_khs_findings_all_formats(
+    fake_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC-3: Given tests/fixtures/known_hosts/khs_findings.txt on fake_home.
+
+    When scan --format terminal, md, json,
+    Then KHS001-KHS006 findings are present in all three formats, JSON validates
+    against schema 1.0, and no key base64 blob or known_hosts(5) comment text
+    leaks into any rendered output.
+    """
+    ssh_dir = fake_home / ".ssh"
+    config = ssh_dir / "config"
+    fixture_text = _KHS_FIXTURE.read_text()
+    (ssh_dir / "known_hosts").write_text(fixture_text)
+
+    base64_blobs = [
+        line.split()[-1]
+        for line in fixture_text.splitlines()
+        if line and not line.startswith("#") and line.split()[-1].startswith("AAAA")
+    ]
+    assert len(base64_blobs) >= 5
+
+    outputs: dict[str, str] = {}
+    for fmt in ("terminal", "md", "json"):
+        rc = main(
+            [
+                "scan",
+                "--format",
+                fmt,
+                "--no-agent",
+                "--ssh-dir",
+                str(ssh_dir),
+                "--config",
+                str(config),
+            ]
+        )
+        assert rc == ExitCode.OK
+        out = capsys.readouterr().out
+        outputs[fmt] = out
+
+        for blob in base64_blobs:
+            assert blob not in out
+        assert "known_hosts(5) fixture" not in out
+        assert "unit level" not in out
+
+        for rule_id in ("KHS001", "KHS002", "KHS003", "KHS004", "KHS005", "KHS006"):
+            assert rule_id in out, f"{rule_id} missing from {fmt} output"
+
+    data = json.loads(outputs["json"])
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    jsonschema.Draft202012Validator(schema).validate(data)
+
+    finding_rule_ids = {f["rule_id"] for f in data["findings"]}
+    assert {"KHS001", "KHS002", "KHS003", "KHS004", "KHS005", "KHS006"} <= finding_rule_ids

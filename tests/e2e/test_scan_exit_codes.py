@@ -13,6 +13,8 @@ from ssh_id_doctor.cli import main
 from ssh_id_doctor.exit_codes import ExitCode
 from ssh_id_doctor.process import ProcessResult, ProcessStatus
 
+_KHS_FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "known_hosts" / "khs_findings.txt"
+
 
 def test_scan_exit_codes_match_spec_5_3(
     home_basic: Path,
@@ -274,3 +276,49 @@ def test_non_finite_timeout_is_rejected(
     for bad in (float("nan"), float("inf")):
         with pytest.raises(ValueError, match="timeout"):
             process.run(["ssh-keygen", "-V"], timeout=bad, max_output=1024)
+
+
+def test_khs_strict_exit_code(
+    fake_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC-5: Given a known_hosts fixture with every KHS001-KHS006 problem,
+
+    when scan --strict, then the exit code is the same as without known_hosts
+    (none of KHS001-KHS006 is severity error).
+    """
+    ssh_dir = fake_home / ".ssh"
+    config = ssh_dir / "config"
+    known_hosts = ssh_dir / "known_hosts"
+
+    base_args = ["--strict", "--no-agent", "--ssh-dir", str(ssh_dir), "--config", str(config)]
+
+    rc_without = main(["scan", *base_args])
+    capsys.readouterr()
+
+    known_hosts.write_text(_KHS_FIXTURE.read_text())
+    rc_with = main(["scan", *base_args])
+    out_with = capsys.readouterr().out
+
+    assert rc_without == ExitCode.OK
+    assert rc_with == rc_without
+
+    # Sanity: the KHS findings are actually present, just none at error severity.
+    rc_json = main(
+        [
+            "scan",
+            "--format",
+            "json",
+            "--no-agent",
+            "--ssh-dir",
+            str(ssh_dir),
+            "--config",
+            str(config),
+        ]
+    )
+    data = json.loads(capsys.readouterr().out)
+    assert rc_json == ExitCode.OK
+    khs_findings = [f for f in data["findings"] if f["rule_id"].startswith("KHS")]
+    assert khs_findings
+    assert all(f["severity"] != "error" for f in khs_findings)
+    assert out_with  # terminal output was produced

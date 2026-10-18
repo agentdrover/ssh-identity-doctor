@@ -1,0 +1,17 @@
+# known_hosts(5) fixture for tests/rules/test_known_hosts_rules.py (unit level)
+# and the e2e KHS001-KHS006 tests (AC-3, AC-4, AC-5). Comments and blank lines
+# are skipped by the parser; every other line below is a real grammar line,
+# crafted so that KHS001-KHS006 each fire exactly once.
+
+exposed-plain.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMwKQfiW86Yu6eXH3bYIk94OnoidaKLausFeWb3nT/iL
+
+[bridge.example.com]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f
+[bridge.example.com]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAMKERgfJi00O0JJUFdeZWxzeoGIj5adpKuyucDHztXc
+
+weak-dss.example.com ssh-dss AAAAB3NzaC1kc3MAAABBAFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFAAAAAVAFFRUVFRUVFRUVFRUVFRUVFRUVFRAAAAQQBHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHAAAAQQBZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZ
+
+@revoked revoked-host.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMwKQfiW86Yu6eXH3bYIk94OnoidaKLausFeWb3nT/iL
+
+broken-grammar.example.com ssh-ed25519
+
+legacy-rsa.example.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDYf1jXV+uGTnHPPrF7Gear3ShbgarG9gHMtiNcmRrM5oQIY0bXE/dmtgwnrj2wQ2uFOn3S/nHBBS3N2O2cQ86rP+qRT1vHIAjeAailuOBkdvkI52/ZWZckAHy1KEVd2du9uxq39mryUl/gEZvS2Zu52nBH4ctu2meUYcMYE4jOkGtI4ioAE9ZxCHheSx595TwH26e7VIpSBWjqNqcWHI/45NqxErORYjp24T+k2bUv3VRsJUYeJVQ+husPHWvvWCXWvdr3MZZiHipyVv7Du/Eu7oX0EZq99E24QycRvcm6Fv2JutoHG6fNbPwtpQc8PFgf08noPDTXKhHxKrdCIkil

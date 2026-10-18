@@ -28,6 +28,22 @@ from ssh_id_doctor.domain import (
     UnresolvedItem,
 )
 
+_WORD_CHAR = r"[A-Za-z0-9_]"
+
+
+def _boundary_pattern(literal: str) -> str:
+    """A ``\\b``-like match for ``literal`` that also works when it starts or ends
+
+    with a non-word character, such as the ``[host]:port`` known_hosts form.
+    ``\\breal\\b`` requires a word char on exactly one side of each edge, so it
+    never matches ``[host]:port`` preceded by a space (non-word on both sides of
+    the leading ``[``). Lookarounds that simply forbid a word char immediately
+    outside the match have no such blind spot, and agree with ``\\b`` whenever
+    ``literal`` starts/ends with a word character.
+    """
+    return rf"(?<!{_WORD_CHAR}){re.escape(literal)}(?!{_WORD_CHAR})"
+
+
 RedactMode = Literal["hosts", "paths", "all"]
 
 
@@ -84,9 +100,9 @@ class Redactor:
                 result = result.replace(p, alias)
         if self.redact_hosts:
             for h, alias in sorted(self._host_map.items(), key=lambda x: -len(x[0])):
-                result = re.sub(r"\b" + re.escape(h) + r"\b", alias, result)
+                result = re.sub(_boundary_pattern(h), alias, result)
             for u, alias in sorted(self._user_map.items(), key=lambda x: -len(x[0])):
-                result = re.sub(r"\b" + re.escape(u) + r"\b", alias, result)
+                result = re.sub(_boundary_pattern(u), alias, result)
         return result
 
 
@@ -129,6 +145,13 @@ def redact(snapshot: ScanSnapshot, mode: RedactMode) -> ScanSnapshot:
         for f in snapshot.findings:
             for h in f.affected_hosts:
                 redactor.get_host_alias(h)
+        for kh in snapshot.known_hosts:
+            for token in kh.hosts:
+                if token.startswith("|1|"):
+                    continue
+                candidate = token[1:] if token.startswith("!") else token
+                if candidate:
+                    redactor.get_host_alias(candidate)
 
     # Transform HostBindings
     new_host_bindings: list[HostBinding] = []
@@ -314,6 +337,7 @@ def redact(snapshot: ScanSnapshot, mode: RedactMode) -> ScanSnapshot:
         schema_version=snapshot.schema_version,
         local_references=tuple(new_local_references),
         unresolved=tuple(new_unresolved),
+        known_hosts=snapshot.known_hosts,
     )
 
 
