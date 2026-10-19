@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -10,6 +12,11 @@ from typing import Any
 import pytest
 
 FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "home_basic"
+DenyOpen = Callable[[str | os.PathLike[str]], contextlib.AbstractContextManager[None]]
+"""Duplicated from ../conftest.py (AGENTS.md: pytest's rootdir-relative "conftest"
+import can resolve to either same-named module): no e2e test imports this fixture
+itself, but a sibling test module's ``from conftest import ... DenyOpen`` must
+succeed whichever of the two ``conftest`` modules Python's import cache hands it."""
 CANARY = "CANARY-PRIVATE-7f3a"
 CANARY_PRIVATE_KEY = (
     f"-----BEGIN OPENSSH PRIVATE KEY-----\n{CANARY}\n-----END OPENSSH PRIVATE KEY-----\n"

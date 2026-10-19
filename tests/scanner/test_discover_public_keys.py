@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from conftest import CANARY, CANARY_PRIVATE_KEY, OpenGuard
+from conftest import CANARY, CANARY_PRIVATE_KEY, DenyOpen, OpenGuard
 from ssh_id_doctor import fs, scanner
 from ssh_id_doctor.domain import Resolution
 
@@ -115,6 +115,7 @@ def test_unreadable_and_outside_root_are_unresolved(
     tmp_path: Path,
     read_spy: list[str],
     open_guard: OpenGuard,
+    deny_open: DenyOpen,
 ) -> None:
     ssh = fake_home / ".ssh"
     outside = tmp_path / "outside"
@@ -124,13 +125,10 @@ def test_unreadable_and_outside_root_are_unresolved(
 
     locked = ssh / "locked.pub"
     locked.write_text("ssh-ed25519 AAAALOCKED locked\n")
-    locked.chmod(0o000)
     (ssh / "escape.pub").symlink_to(external)
 
-    try:
+    with deny_open(locked):
         observations = scanner.discover_public_keys(ssh)
-    finally:
-        locked.chmod(0o600)
 
     by_name = {Path(o.path).name: o for o in observations}
     assert by_name["locked.pub"].resolution is Resolution.UNREADABLE

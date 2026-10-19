@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from conftest import CANARY, CANARY_PRIVATE_KEY, OpenGuard
+from conftest import CANARY, CANARY_PRIVATE_KEY, DenyOpen, OpenGuard
 from ssh_id_doctor import fs
 from ssh_id_doctor.domain import Resolution
 from ssh_id_doctor.fs import NotAConfigFile, NotAKnownHostsFile, PrivateKeyAccessDenied
@@ -294,7 +294,7 @@ def test_read_known_hosts_text_fstat_refuses_fifo_even_if_the_prior_stat_lied(
 
 
 def test_read_known_hosts_text_permission_error_names_only_the_base_name(
-    tmp_path: Path, open_guard: OpenGuard
+    tmp_path: Path, open_guard: OpenGuard, deny_open: DenyOpen
 ) -> None:
     """Review finding #1794 gen1 (low, fs.py:266): an ``OSError`` raised by the
     ``stat``/``open`` syscalls themselves (unlike the function's own explicit
@@ -306,52 +306,45 @@ def test_read_known_hosts_text_permission_error_names_only_the_base_name(
     open_guard.guard_root(ssh_dir)
     target = ssh_dir / "known_hosts"
     target.write_text("example.com ssh-ed25519 AAAA\n")
-    target.chmod(0o000)
-    try:
-        with pytest.raises(PermissionError) as exc_info:
-            fs.read_known_hosts_text(target, ssh_dir=ssh_dir)
-        assert str(ssh_dir) not in str(exc_info.value)
-        assert "known_hosts" in str(exc_info.value)
-    finally:
-        target.chmod(0o600)
+    with deny_open(target), pytest.raises(PermissionError) as exc_info:
+        fs.read_known_hosts_text(target, ssh_dir=ssh_dir)
+    assert str(ssh_dir) not in str(exc_info.value)
+    assert "known_hosts" in str(exc_info.value)
 
 
 def test_read_known_hosts_text_permission_error_does_not_leak_path_via_traceback(
     guarded_ssh_dir: Path,
+    deny_open: DenyOpen,
 ) -> None:
     """Review finding (low, fs.py:272/281): the stat/open ``OSError`` was re-raised
     with ``from exc``, so the original, path-carrying exception stayed reachable as
     ``__cause__`` and would still appear — full path and all — in a printed
     traceback, even though the new exception's own message is sanitized.
 
-    Permissions 0o000 deny ``os.open`` but not ``os.stat`` (stat only needs
-    execute on the containing directories), so this exercises the *second*
-    ``except OSError`` branch (around ``os.open``); the ``os.stat`` branch has
-    its own regression test below."""
+    ``deny_open`` denies ``os.open`` only, not ``os.stat`` (chmod(0o000) would
+    do the same on a non-root process, but not under root — SID #1860), so
+    this exercises the *second* ``except OSError`` branch (around
+    ``os.open``); the ``os.stat`` branch has its own regression test below."""
     ssh_dir = guarded_ssh_dir
     target = ssh_dir / "known_hosts"
     target.write_text("example.com ssh-ed25519 AAAA\n")
-    target.chmod(0o000)
-    try:
-        with pytest.raises(PermissionError) as exc_info:
-            fs.read_known_hosts_text(target, ssh_dir=ssh_dir)
-        assert exc_info.value.__cause__ is None
-        rendered = "".join(
-            traceback.format_exception(
-                type(exc_info.value), exc_info.value, exc_info.value.__traceback__
-            )
+    with deny_open(target), pytest.raises(PermissionError) as exc_info:
+        fs.read_known_hosts_text(target, ssh_dir=ssh_dir)
+    assert exc_info.value.__cause__ is None
+    rendered = "".join(
+        traceback.format_exception(
+            type(exc_info.value), exc_info.value, exc_info.value.__traceback__
         )
-        assert str(ssh_dir) not in rendered
-        assert str(target) not in rendered
-    finally:
-        target.chmod(0o600)
+    )
+    assert str(ssh_dir) not in rendered
+    assert str(target) not in rendered
 
 
 def test_stat_error_traceback_has_no_full_path(
     guarded_ssh_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC-1 (#1833): the test above only reaches the ``except OSError`` branch
-    around ``os.open`` — chmod 0o000 blocks ``open`` but not ``stat``. The
+    around ``os.open`` — ``deny_open`` denies ``open`` but not ``stat``. The
     branch around the earlier ``os.stat(real).st_mode`` call (fs.py) has its
     own ``from None`` rollback that no existing test exercised; this
     monkeypatches ``os.stat`` itself to raise, forcing that first branch.

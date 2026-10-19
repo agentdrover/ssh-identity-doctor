@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import stat
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +15,8 @@ import pytest
 from ssh_id_doctor.cli import main
 from ssh_id_doctor.exit_codes import ExitCode
 
+DenyOpenInDir = Callable[[str | Path], AbstractContextManager[None]]
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_PATH = REPO_ROOT / "src" / "ssh_id_doctor" / "reporting" / "schema" / "scan-1.0.json"
 _KHS_FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "known_hosts" / "khs_findings.txt"
@@ -21,8 +25,9 @@ _KHS_FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "known_hosts" 
 def test_output_atomic_0600_and_exit_4_keeps_old_report(
     home_basic: Path,
     tmp_path: Path,
+    deny_open_in_dir: DenyOpenInDir,
 ) -> None:
-    """AC-4: Given existing report.json with 'OLD' and dir out/ without write permissions.
+    """AC-4: Given existing report.json with 'OLD' and dir out/ that denies writes.
 
     When:
     (a) scan --output report.json
@@ -31,6 +36,12 @@ def test_output_atomic_0600_and_exit_4_keeps_old_report(
     (a) exit 0, file atomically replaced, mode 0600;
     (b) exit 4, no leftover temp files;
     upon simulated os.replace error, old report retains 'OLD'.
+
+    (b) used to make ``out/`` unwritable via ``mkdir(mode=0o555)``, but under root a
+    directory's write-permission bits do not stop file creation inside it, so the
+    write would succeed instead of failing (SID #1860). ``deny_open_in_dir`` denies
+    the ``os.open`` the product's atomic writer uses for its temp file instead, for
+    any user.
     """
     ssh_dir = str(home_basic / ".ssh")
     config = str(home_basic / ".ssh" / "config")
@@ -61,25 +72,26 @@ def test_output_atomic_0600_and_exit_4_keeps_old_report(
     file_stat = report_file.stat()
     assert stat.S_IMODE(file_stat.st_mode) == 0o600
 
-    # (b) scan --output out/report.json where out/ has no write permissions
+    # (b) scan --output out/report.json where out/ denies writes
     unwritable_dir = tmp_path / "unwritable_dir"
-    unwritable_dir.mkdir(mode=0o555)
+    unwritable_dir.mkdir()
     unwritable_target = unwritable_dir / "report.json"
 
-    rc_b = main(
-        [
-            "scan",
-            "--format",
-            "json",
-            "--no-agent",
-            "--ssh-dir",
-            ssh_dir,
-            "--config",
-            config,
-            "--output",
-            str(unwritable_target),
-        ]
-    )
+    with deny_open_in_dir(unwritable_dir):
+        rc_b = main(
+            [
+                "scan",
+                "--format",
+                "json",
+                "--no-agent",
+                "--ssh-dir",
+                ssh_dir,
+                "--config",
+                config,
+                "--output",
+                str(unwritable_target),
+            ]
+        )
     assert rc_b == ExitCode.REPORT_WRITE_FAILED
     # Verify no temp files left in unwritable_dir
     leftovers = list(unwritable_dir.iterdir())

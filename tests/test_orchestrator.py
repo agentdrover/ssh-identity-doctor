@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import CANARY_PRIVATE_KEY, OpenGuard
+from conftest import CANARY_PRIVATE_KEY, DenyOpen, OpenGuard
 from ssh_id_doctor.adapters.github import RegistryResult, RegistryState
 from ssh_id_doctor.cli import main
 from ssh_id_doctor.domain import (
@@ -364,6 +364,7 @@ def _scan_home_basic(home: Path) -> ScanSnapshot:
 def test_known_hosts_coverage_states(
     home_basic_setup: Path,
     open_guard: OpenGuard,
+    deny_open: DenyOpen,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -405,17 +406,14 @@ def test_known_hosts_coverage_states(
     assert cov.detail == "NotAKnownHostsFile"
     known_hosts.unlink()
 
-    # 3. PermissionError (an unreadable regular file) -> unavailable, detail is the
-    # class name.
+    # 3. PermissionError (os.open denied, as any user including root) -> unavailable,
+    # detail is the class name.
     known_hosts.write_text(f"example.com {valid_ed25519}\n")
-    known_hosts.chmod(0o000)
-    try:
+    with deny_open(known_hosts):
         cov = coverage(run())
-        assert cov.state is CoverageState.UNAVAILABLE
-        assert cov.detail == "PermissionError"
-    finally:
-        known_hosts.chmod(0o600)
-        known_hosts.unlink()
+    assert cov.state is CoverageState.UNAVAILABLE
+    assert cov.detail == "PermissionError"
+    known_hosts.unlink()
 
     # 4. empty / comments only -> empty.
     known_hosts.write_text("# just a comment\n\n")
