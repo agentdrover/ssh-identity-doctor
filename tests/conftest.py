@@ -21,6 +21,8 @@ Three layers, all built on the one HOME redirection below (SID-1):
 from __future__ import annotations
 
 import builtins
+import contextlib
+import errno
 import io
 import os
 from collections.abc import Callable, Iterator
@@ -153,6 +155,43 @@ def _private_open_guard(
 def open_guard(_private_open_guard: OpenGuard) -> OpenGuard:
     """The active guard, for tests that assert on (or deliberately clear) violations."""
     return _private_open_guard
+
+
+DenyOpen = Callable[[str | os.PathLike[str]], contextlib.AbstractContextManager[None]]
+"""A context manager factory: inside it, ``os.open`` on exactly one path raises
+``PermissionError``, as if that path's permissions denied access."""
+
+
+@pytest.fixture
+def deny_open(open_guard: OpenGuard, monkeypatch: pytest.MonkeyPatch) -> DenyOpen:
+    """Make a context manager that denies ``os.open`` on exactly one path (EACCES).
+
+    Stands in for ``chmod(0o000)``: under root ``chmod`` does not actually deny
+    access, so a test relying on it to raise ``PermissionError`` is false-green
+    as root and fails as it (SID #1860). This patches the syscall the product
+    itself uses to read the file instead, so the test exercises the same
+    behaviour for any user. Depends on ``open_guard`` (so ``_private_open_guard``
+    has already wrapped ``os.open``) and reads the CURRENT ``os.open`` only when
+    the context manager is entered, not one captured at import time — otherwise
+    a path other than the denied one would bypass the open guard instead of
+    going through it as usual.
+    """
+
+    @contextlib.contextmanager
+    def _deny(path: str | os.PathLike[str]) -> Iterator[None]:
+        target = os.fspath(path)
+        current_os_open = os.open
+
+        def denied_open(candidate: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+            if os.fspath(candidate) == target:
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), target)
+            return current_os_open(candidate, flags, *args, **kwargs)
+
+        with monkeypatch.context() as ctx:
+            ctx.setattr(os, "open", denied_open)
+            yield
+
+    return _deny
 
 
 @pytest.fixture
