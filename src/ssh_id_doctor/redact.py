@@ -39,6 +39,15 @@ spot, and agrees with ``\\b`` whenever the literal starts/ends with a word
 character.
 """
 
+_PATH_WORD_CHAR = r"[A-Za-z0-9]"
+"""Like ``_WORD_CHAR`` but excludes ``_``, for matching a registered host/user
+name inside a path's *basename*. A key named after its host conventionally
+uses ``_`` as the separator (``id_bridge.example.com``), so treating ``_`` as
+a word character there would hide the boundary and leave the host name
+unmatched, unlike in free-text sentences where ``_`` genuinely joins one
+identifier.
+"""
+
 
 RedactMode = Literal["hosts", "paths", "all"]
 
@@ -114,10 +123,16 @@ class Redactor:
         if not path:
             return path
         if path not in self._path_map:
-            # Deterministic hash of full path to preserve uniqueness
-            # Replace path with ~/redacted/<basename-hash>
+            # Deterministic hash of full (original, unredacted) path to
+            # preserve uniqueness -- two paths with the same basename must
+            # not collide just because their basename gets redacted alike.
             h = hashlib.sha256(path.encode("utf-8")).hexdigest()[:8]
             name = path.rstrip("/").split("/")[-1]
+            if self.redact_hosts:
+                # A key named after its host/user (id_bridge.example.com)
+                # must not leak that name through the basename just because
+                # host/user redaction only otherwise touches free text.
+                name = self._substitute(name, word_char=_PATH_WORD_CHAR)
             if name.endswith(".pub"):
                 clean_name = name[:-4]
                 self._path_map[path] = f"~/.../{clean_name}-{h}.pub"
@@ -173,7 +188,15 @@ class Redactor:
 
     def _redact_hosts_and_users(self, text: str) -> str:
         """One-pass alias substitution for hosts, users, and whole known_hosts
-        tokens, longest literal first, in a single combined regex.
+        tokens, longest literal first, in a single combined regex, using the
+        free-text word boundary (``_`` counts as a word character)."""
+        return self._substitute(text, word_char=_WORD_CHAR)
+
+    def _substitute(self, text: str, *, word_char: str) -> str:
+        """Shared implementation of ``_redact_hosts_and_users``, parametrized
+        on the boundary class so a path basename (where ``_`` conventionally
+        separates a host/user name rather than joining one identifier) can
+        use ``_PATH_WORD_CHAR`` instead.
 
         A single pass (one ``re.sub`` call) guarantees a substituted alias is
         never rescanned by a later substitution -- unlike sequential
@@ -193,7 +216,7 @@ class Redactor:
             return text
         literals = sorted(replacements, key=len, reverse=True)
         alternation = "|".join(re.escape(lit) for lit in literals)
-        pattern = re.compile(rf"(?<!{_WORD_CHAR})(?:{alternation})(?!{_WORD_CHAR})")
+        pattern = re.compile(rf"(?<!{word_char})(?:{alternation})(?!{word_char})")
         return pattern.sub(lambda m: replacements[m.group(0)], text)
 
 
@@ -201,7 +224,32 @@ def redact(snapshot: ScanSnapshot, mode: RedactMode) -> ScanSnapshot:
     """Transform snapshot by redacting sensitive data according to mode."""
     redactor = Redactor(mode)
 
-    # 1. Pre-register paths from local references & public keys
+    # 1. Pre-register hosts and users from host bindings, before any path is
+    # aliased: get_path_alias redacts a registered host/user name out of a
+    # path's basename (e.g. IdentityFile ~/.ssh/id_bridge.example.com for
+    # Host bridge.example.com), which only works if the host/user map is
+    # already populated by the time the first path is seen (sdd-spec #1908).
+    if redactor.redact_hosts:
+        for hb in snapshot.host_bindings:
+            for pat in hb.patterns:
+                redactor.get_host_alias(pat)
+            if hb.hostname:
+                redactor.get_host_alias(hb.hostname)
+            if hb.user:
+                redactor.get_user_alias(hb.user)
+        for f in snapshot.findings:
+            for h in f.affected_hosts:
+                if _is_known_hosts_finding(f):
+                    redactor.register_known_hosts_token(h)
+                else:
+                    redactor.get_host_alias(h)
+        for kh in snapshot.known_hosts:
+            for token in kh.hosts:
+                target = _known_hosts_alias_target(token)
+                if target is not None:
+                    redactor.get_host_alias(target)
+
+    # 2. Pre-register paths from local references & public keys
     if redactor.redact_paths:
         for ident in snapshot.identities:
             for ref in ident.local_references:
@@ -223,27 +271,6 @@ def redact(snapshot: ScanSnapshot, mode: RedactMode) -> ScanSnapshot:
             # Detail might be an included path
             if "/" in item.detail or item.detail.endswith((".conf", ".pub", "config")):
                 redactor.get_path_alias(item.detail)
-
-    # 2. Pre-register hosts and users from host bindings
-    if redactor.redact_hosts:
-        for hb in snapshot.host_bindings:
-            for pat in hb.patterns:
-                redactor.get_host_alias(pat)
-            if hb.hostname:
-                redactor.get_host_alias(hb.hostname)
-            if hb.user:
-                redactor.get_user_alias(hb.user)
-        for f in snapshot.findings:
-            for h in f.affected_hosts:
-                if _is_known_hosts_finding(f):
-                    redactor.register_known_hosts_token(h)
-                else:
-                    redactor.get_host_alias(h)
-        for kh in snapshot.known_hosts:
-            for token in kh.hosts:
-                target = _known_hosts_alias_target(token)
-                if target is not None:
-                    redactor.get_host_alias(target)
 
     # Transform HostBindings
     new_host_bindings: list[HostBinding] = []

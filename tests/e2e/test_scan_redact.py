@@ -393,3 +393,81 @@ def test_redact_known_hosts_port_like_host_name_stays_consistent(
     khs002 = next(f for f in data["findings"] if f["rule_id"] == "KHS002")
     assert khs002["affected_hosts"] == [f"[{config_alias}]:2222"]
     assert khs002["title"] == f"Conflicting known_hosts key for [{config_alias}]:2222 (ssh-ed25519)"
+
+
+def test_redact_hides_host_name_inside_key_file_name(
+    fake_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC-1 (#1908): a key named after its host must not leak the host name
+    through its file *name* in a masked report, even though
+    ``get_path_alias`` only hashed the full path and kept the basename as-is.
+
+    Given ssh config 'Host bridge.example.com' with IdentityFile
+    '~/.ssh/id_bridge.example.com' (missing) and a second Host whose
+    IdentityFile is '~/.ssh/archive/id_bridge.example.com' -- a different
+    full path sharing the same basename,
+    when scanning with --redact all in terminal/md/json,
+    then 'bridge.example.com' never leaks (not even via the file name), the
+    path alias is the same alias everywhere it is rendered in the JSON
+    (host_bindings, findings, local_references), and the two paths that
+    share a basename get two different aliases.
+    """
+    ssh_dir = fake_home / ".ssh"
+    config_path = ssh_dir / "config"
+    archive_dir = ssh_dir / "archive"
+    archive_dir.mkdir()
+
+    config_path.write_text(
+        "Host bridge.example.com\n"
+        "    IdentityFile ~/.ssh/id_bridge.example.com\n"
+        "Host old-bridge.example.com\n"
+        "    IdentityFile ~/.ssh/archive/id_bridge.example.com\n"
+    )
+
+    base_args = [
+        "--no-agent",
+        "--ssh-dir",
+        str(ssh_dir),
+        "--config",
+        str(config_path),
+    ]
+
+    outputs: dict[str, str] = {}
+    for fmt in ("terminal", "md", "json"):
+        rc = main(["scan", "--format", fmt, "--redact", "all", *base_args])
+        assert rc == ExitCode.OK
+        out = capsys.readouterr().out
+        outputs[fmt] = out
+        assert "bridge.example.com" not in out, f"leaked in --redact all ({fmt})"
+
+    data = json.loads(outputs["json"])
+
+    alias_re = re.compile(r"~/\.\.\./id_host-\d+-[0-9a-f]{8}")
+
+    # host_bindings: two different (raw, as written in config) IdentityFile
+    # paths sharing the basename "id_bridge.example.com" get two different
+    # aliases, neither of which exposes the host name.
+    assert len(data["host_bindings"]) == 2
+    hb_alias_1, hb_alias_2 = (hb["identity_references"][0] for hb in data["host_bindings"])
+    assert hb_alias_1 != hb_alias_2
+    assert alias_re.fullmatch(hb_alias_1)
+    assert alias_re.fullmatch(hb_alias_2)
+
+    # local_references / CFG001 findings: same story for the two (expanded)
+    # paths, and a given exact path string gets the *same* alias wherever it
+    # is rendered -- matched here by the shared config source_line.
+    local_refs_by_line = {ref["source_line"]: ref["path"] for ref in data["local_references"]}
+    assert len(local_refs_by_line) == 2
+    for alias in local_refs_by_line.values():
+        assert alias_re.fullmatch(alias)
+    assert len(set(local_refs_by_line.values())) == 2
+
+    cfg001_findings = [f for f in data["findings"] if f["rule_id"] == "CFG001"]
+    assert len(cfg001_findings) == 2
+    for finding in cfg001_findings:
+        line = finding["evidence"][0]["line"]
+        assert finding["evidence"][0]["detail"] == local_refs_by_line[line]
+        assert alias_re.search(finding["title"])
+        assert alias_re.search(finding["summary"])
+        assert finding["manual_remediation"][0] == f"ls -l {local_refs_by_line[line]}"
