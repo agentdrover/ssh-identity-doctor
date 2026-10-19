@@ -13,6 +13,7 @@ Markdown, and JSON render identically.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from typing import Literal
 
@@ -103,6 +104,7 @@ class Redactor:
         self._host_map: dict[str, str] = {}
         self._user_map: dict[str, str] = {}
         self._path_map: dict[str, str] = {}
+        self._path_alias_by_canonical: dict[str, str] = {}
         self._known_hosts_token_map: dict[str, str] = {}
 
     def get_host_alias(self, host: str) -> str:
@@ -122,23 +124,47 @@ class Redactor:
     def get_path_alias(self, path: str) -> str:
         if not path:
             return path
-        if path not in self._path_map:
-            # Deterministic hash of full (original, unredacted) path to
-            # preserve uniqueness -- two paths with the same basename must
-            # not collide just because their basename gets redacted alike.
-            h = hashlib.sha256(path.encode("utf-8")).hexdigest()[:8]
-            name = path.rstrip("/").split("/")[-1]
+        if path in self._path_map:
+            return self._path_map[path]
+
+        # Two spellings of the same file (an ssh config's raw, unexpanded
+        # '~/...' IdentityFile value vs. the expanded absolute path computed
+        # for the matching LocalReference) must share one alias (sdd-spec
+        # #1908 AC-1): key the alias on the canonical form, keeping the
+        # literal-spelling map (self._path_map) only for free-text matching
+        # in redact_text_sub.
+        canonical = self._canonical_path(path)
+        if canonical not in self._path_alias_by_canonical:
+            # Deterministic hash of the canonical path to preserve uniqueness
+            # -- two paths with the same basename must not collide just
+            # because their basename gets redacted alike.
+            h = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:8]
+            name = canonical.rstrip("/").split("/")[-1]
             if self.redact_hosts:
                 # A key named after its host/user (id_bridge.example.com)
                 # must not leak that name through the basename just because
                 # host/user redaction only otherwise touches free text.
-                name = self._substitute(name, word_char=_PATH_WORD_CHAR)
+                name = self._apply(name, self._host_user_replacements(), word_char=_PATH_WORD_CHAR)
             if name.endswith(".pub"):
                 clean_name = name[:-4]
-                self._path_map[path] = f"~/.../{clean_name}-{h}.pub"
+                alias = f"~/.../{clean_name}-{h}.pub"
             else:
-                self._path_map[path] = f"~/.../{name}-{h}"
-        return self._path_map[path]
+                alias = f"~/.../{name}-{h}"
+            self._path_alias_by_canonical[canonical] = alias
+
+        alias = self._path_alias_by_canonical[canonical]
+        self._path_map[path] = alias
+        return alias
+
+    @staticmethod
+    def _canonical_path(path: str) -> str:
+        """Normalize a path for alias deduplication only (never for display):
+        expand a leading ``~`` the same way ``references._expand`` does (both
+        ultimately key off ``$HOME``), then ``normpath``, so an unexpanded
+        config value and its already-expanded counterpart collapse to one
+        canonical string and thus one alias."""
+        expanded = os.path.expanduser(path) if path.startswith("~") else path
+        return os.path.normpath(expanded)
 
     def register_known_hosts_token(self, token: str) -> str:
         """Register one known_hosts(5) host token from a KHS-rule Finding's
@@ -174,44 +200,50 @@ class Redactor:
         return rendered
 
     def redact_text_sub(self, text: str) -> str:
-        """Substitute any known hosts, users, and paths in strings (titles, summaries, details)."""
+        """Substitute any known hosts, users, known_hosts tokens, and paths in
+        strings (titles, summaries, details), in one atomic pass.
+
+        Paths and hosts/users/known_hosts tokens are combined into the same
+        single ``re.sub`` call (longest literal first) rather than two
+        sequential passes, so a path alias inserted by this substitution (it
+        may itself already contain a host alias like ``host-1``, baked in by
+        ``get_path_alias``) is never rescanned by a second, independent hosts
+        pass -- which would otherwise wrongly rewrite it if some unrelated
+        registered host happened to share that literal text (sdd-spec #1908
+        review finding 2; same hazard the single combined pass already
+        guards against for hosts/known_hosts tokens, below).
+        """
         if not text:
             return text
-        result = text
+        replacements: dict[str, str] = {}
         if self.redact_paths:
-            # Substitute longest paths first
-            for p, alias in sorted(self._path_map.items(), key=lambda x: -len(x[0])):
-                result = result.replace(p, alias)
+            replacements.update(self._path_map)
         if self.redact_hosts:
-            result = self._redact_hosts_and_users(result)
-        return result
+            replacements.update(self._host_user_replacements())
+        return self._apply(text, replacements, word_char=_WORD_CHAR)
 
-    def _redact_hosts_and_users(self, text: str) -> str:
-        """One-pass alias substitution for hosts, users, and whole known_hosts
-        tokens, longest literal first, in a single combined regex, using the
-        free-text word boundary (``_`` counts as a word character)."""
-        return self._substitute(text, word_char=_WORD_CHAR)
-
-    def _substitute(self, text: str, *, word_char: str) -> str:
-        """Shared implementation of ``_redact_hosts_and_users``, parametrized
-        on the boundary class so a path basename (where ``_`` conventionally
-        separates a host/user name rather than joining one identifier) can
-        use ``_PATH_WORD_CHAR`` instead.
-
-        A single pass (one ``re.sub`` call) guarantees a substituted alias is
-        never rescanned by a later substitution -- unlike sequential
-        per-map/per-entry ``re.sub`` calls, which could re-match text an
-        earlier substitution had just inserted (sdd-spec #1868 review
-        finding 2). Registering whole known_hosts tokens (not just bare host
-        names) in the same combined, longest-first alternation also makes a
-        longer token match as one atomic unit ahead of any shorter embedded
-        literal it would otherwise ambiguously overlap with.
-        """
-        replacements: dict[str, str] = {
+    def _host_user_replacements(self) -> dict[str, str]:
+        return {
             **self._user_map,
             **self._host_map,
             **self._known_hosts_token_map,
         }
+
+    @staticmethod
+    def _apply(text: str, replacements: dict[str, str], *, word_char: str) -> str:
+        """One-pass alias substitution, longest literal first, in a single
+        combined regex.
+
+        A single pass (one ``re.sub`` call) guarantees a substituted alias is
+        never rescanned by a later substitution -- unlike sequential
+        per-map/per-entry ``re.sub`` or ``str.replace`` calls, which could
+        re-match text an earlier substitution had just inserted (sdd-spec
+        #1868 review finding 2, #1908 review finding 2). Registering whole
+        known_hosts tokens (not just bare host names) in the same combined,
+        longest-first alternation also makes a longer token match as one
+        atomic unit ahead of any shorter embedded literal it would otherwise
+        ambiguously overlap with.
+        """
         if not replacements:
             return text
         literals = sorted(replacements, key=len, reverse=True)
