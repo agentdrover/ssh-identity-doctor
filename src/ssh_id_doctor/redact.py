@@ -29,19 +29,15 @@ from ssh_id_doctor.domain import (
 )
 
 _WORD_CHAR = r"[A-Za-z0-9_]"
-
-
-def _boundary_pattern(literal: str) -> str:
-    """A ``\\b``-like match for ``literal`` that also works when it starts or ends
-
-    with a non-word character, such as the ``[host]:port`` known_hosts form.
-    ``\\breal\\b`` requires a word char on exactly one side of each edge, so it
-    never matches ``[host]:port`` preceded by a space (non-word on both sides of
-    the leading ``[``). Lookarounds that simply forbid a word char immediately
-    outside the match have no such blind spot, and agree with ``\\b`` whenever
-    ``literal`` starts/ends with a word character.
-    """
-    return rf"(?<!{_WORD_CHAR}){re.escape(literal)}(?!{_WORD_CHAR})"
+"""Used to build a ``\\b``-like boundary around a substituted literal that also
+works when it starts or ends with a non-word character, such as the
+``[host]:port`` known_hosts form. ``\\breal\\b`` requires a word char on
+exactly one side of each edge, so it never matches ``[host]:port`` preceded
+by a space (non-word on both sides of the leading ``[``). A lookaround that
+simply forbids a word char immediately outside the match has no such blind
+spot, and agrees with ``\\b`` whenever the literal starts/ends with a word
+character.
+"""
 
 
 RedactMode = Literal["hosts", "paths", "all"]
@@ -72,23 +68,18 @@ def _known_hosts_alias_target(token: str) -> str | None:
     return match.group(1) if match else rest
 
 
-def _redact_known_hosts_host_token(redactor: Redactor, token: str) -> str:
-    """Redact one Finding.affected_hosts token for display.
+def _is_known_hosts_finding(f: Finding) -> bool:
+    """True only for findings from known_hosts(5) rules (``KHS*``).
 
-    A hashed ``|1|`` token is returned unchanged; a ``!host`` or
-    ``[host]:port`` form keeps its negation/brackets/port but aliases the
-    host part, so the display matches ``get_host_alias`` for the same host
-    written bare (sdd-spec #1868).
+    Only those put known_hosts-grammar tokens (``!neg``, ``[host]:port``,
+    hashed ``|1|...``) in ``affected_hosts``. Config/agent rules (``CFG*``,
+    ``AGT*``) put raw ssh config ``Host`` patterns there instead -- whole
+    strings, possibly containing ``!`` or glob chars that are part of the
+    pattern itself, not known_hosts negation/brackets -- which must be
+    aliased the same whole-string way as ``HostBinding.patterns`` (sdd-spec
+    #1868 review finding 1).
     """
-    if token.startswith("|1|"):
-        return token
-    prefix, rest = _strip_known_hosts_negation(token)
-    if not rest:
-        return token
-    match = _BRACKET_PORT_RE.match(rest)
-    if match:
-        return f"{prefix}[{redactor.get_host_alias(match.group(1))}]:{match.group(2)}"
-    return f"{prefix}{redactor.get_host_alias(rest)}"
+    return f.rule_id.startswith("KHS")
 
 
 class Redactor:
@@ -103,6 +94,7 @@ class Redactor:
         self._host_map: dict[str, str] = {}
         self._user_map: dict[str, str] = {}
         self._path_map: dict[str, str] = {}
+        self._known_hosts_token_map: dict[str, str] = {}
 
     def get_host_alias(self, host: str) -> str:
         if not host:
@@ -133,6 +125,39 @@ class Redactor:
                 self._path_map[path] = f"~/.../{name}-{h}"
         return self._path_map[path]
 
+    def register_known_hosts_token(self, token: str) -> str:
+        """Register one known_hosts(5) host token from a KHS-rule Finding's
+        ``affected_hosts`` and return its redacted rendering.
+
+        A hashed ``|1|`` token is returned unchanged; a ``!host`` or
+        ``[host]:port`` form keeps its negation/brackets/port but aliases the
+        host part, so the rendering matches ``get_host_alias`` for the same
+        host written bare, e.g. an ssh config ``Host`` line (sdd-spec #1868).
+
+        Also caches the exact original token -> rendering so
+        ``redact_text_sub`` can later match the *whole* token as one unit in
+        free text (title/summary/remediation), ahead of any shorter alias or
+        bare host/port substring it would otherwise collide with -- e.g. a
+        host named ``2222`` inside ``[2222]:2222``, or a registered host name
+        that happens to occur as a substring of an unrelated hashed ``|1|``
+        token's salt/hash (sdd-spec #1868 review findings 2-3).
+        """
+        if token in self._known_hosts_token_map:
+            return self._known_hosts_token_map[token]
+        if token.startswith("|1|"):
+            rendered = token
+        else:
+            prefix, rest = _strip_known_hosts_negation(token)
+            match = _BRACKET_PORT_RE.match(rest) if rest else None
+            if match:
+                rendered = f"{prefix}[{self.get_host_alias(match.group(1))}]:{match.group(2)}"
+            elif rest:
+                rendered = f"{prefix}{self.get_host_alias(rest)}"
+            else:
+                rendered = token
+        self._known_hosts_token_map[token] = rendered
+        return rendered
+
     def redact_text_sub(self, text: str) -> str:
         """Substitute any known hosts, users, and paths in strings (titles, summaries, details)."""
         if not text:
@@ -143,11 +168,33 @@ class Redactor:
             for p, alias in sorted(self._path_map.items(), key=lambda x: -len(x[0])):
                 result = result.replace(p, alias)
         if self.redact_hosts:
-            for h, alias in sorted(self._host_map.items(), key=lambda x: -len(x[0])):
-                result = re.sub(_boundary_pattern(h), alias, result)
-            for u, alias in sorted(self._user_map.items(), key=lambda x: -len(x[0])):
-                result = re.sub(_boundary_pattern(u), alias, result)
+            result = self._redact_hosts_and_users(result)
         return result
+
+    def _redact_hosts_and_users(self, text: str) -> str:
+        """One-pass alias substitution for hosts, users, and whole known_hosts
+        tokens, longest literal first, in a single combined regex.
+
+        A single pass (one ``re.sub`` call) guarantees a substituted alias is
+        never rescanned by a later substitution -- unlike sequential
+        per-map/per-entry ``re.sub`` calls, which could re-match text an
+        earlier substitution had just inserted (sdd-spec #1868 review
+        finding 2). Registering whole known_hosts tokens (not just bare host
+        names) in the same combined, longest-first alternation also makes a
+        longer token match as one atomic unit ahead of any shorter embedded
+        literal it would otherwise ambiguously overlap with.
+        """
+        replacements: dict[str, str] = {
+            **self._user_map,
+            **self._host_map,
+            **self._known_hosts_token_map,
+        }
+        if not replacements:
+            return text
+        literals = sorted(replacements, key=len, reverse=True)
+        alternation = "|".join(re.escape(lit) for lit in literals)
+        pattern = re.compile(rf"(?<!{_WORD_CHAR})(?:{alternation})(?!{_WORD_CHAR})")
+        return pattern.sub(lambda m: replacements[m.group(0)], text)
 
 
 def redact(snapshot: ScanSnapshot, mode: RedactMode) -> ScanSnapshot:
@@ -188,9 +235,10 @@ def redact(snapshot: ScanSnapshot, mode: RedactMode) -> ScanSnapshot:
                 redactor.get_user_alias(hb.user)
         for f in snapshot.findings:
             for h in f.affected_hosts:
-                target = _known_hosts_alias_target(h)
-                if target is not None:
-                    redactor.get_host_alias(target)
+                if _is_known_hosts_finding(f):
+                    redactor.register_known_hosts_token(h)
+                else:
+                    redactor.get_host_alias(h)
         for kh in snapshot.known_hosts:
             for token in kh.hosts:
                 target = _known_hosts_alias_target(token)
@@ -333,7 +381,12 @@ def redact(snapshot: ScanSnapshot, mode: RedactMode) -> ScanSnapshot:
             )
 
         aff_hosts = (
-            tuple(_redact_known_hosts_host_token(redactor, h) for h in f.affected_hosts)
+            tuple(
+                redactor.register_known_hosts_token(h)
+                if _is_known_hosts_finding(f)
+                else redactor.get_host_alias(h)
+                for h in f.affected_hosts
+            )
             if redactor.redact_hosts
             else f.affected_hosts
         )

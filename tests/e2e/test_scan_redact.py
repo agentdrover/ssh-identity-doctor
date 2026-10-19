@@ -226,3 +226,170 @@ def test_redact_known_hosts_port_form_shares_host_alias(
     assert match is not None
     assert match.group(1) == config_alias
     assert khs002["title"] == f"Conflicting known_hosts key for [{config_alias}]:2222 (ssh-ed25519)"
+
+
+def test_redact_config_host_pattern_not_parsed_as_known_hosts_token(
+    fake_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression (#1868 review finding 1): a CFG001/AGT002 finding's
+    affected_hosts holds raw ssh config Host patterns, not known_hosts
+    tokens -- a '!'-negated pattern there must be aliased as the whole
+    string (like HostBinding.patterns), not have its '!' stripped the way a
+    known_hosts negation would be.
+
+    Given 'Host *.example.com !private.example.com' with a missing
+    IdentityFile (fires CFG001, affected_hosts = the Host block's patterns),
+    when scanning with --redact all,
+    then the host_bindings.patterns alias and the CFG001 finding's
+    affected_hosts alias agree for both patterns, and manual_remediation
+    (which embeds affected_hosts[0] as free text) uses the same alias too.
+    """
+    ssh_dir = fake_home / ".ssh"
+    config_path = ssh_dir / "config"
+    config_path.write_text(
+        "Host *.example.com !private.example.com\n    IdentityFile ~/.ssh/missing_key\n"
+    )
+
+    rc = main(
+        [
+            "scan",
+            "--format",
+            "json",
+            "--no-agent",
+            "--redact",
+            "all",
+            "--ssh-dir",
+            str(ssh_dir),
+            "--config",
+            str(config_path),
+        ]
+    )
+    assert rc == ExitCode.OK
+    out = capsys.readouterr().out
+    assert "example.com" not in out
+    data = json.loads(out)
+
+    host_binding = next(hb for hb in data["host_bindings"] if len(hb["patterns"]) == 2)
+    glob_alias, negated_alias = host_binding["patterns"]
+    assert re.fullmatch(r"host-\d+", glob_alias)
+    assert re.fullmatch(r"host-\d+", negated_alias)
+    assert glob_alias != negated_alias
+
+    cfg001 = next(f for f in data["findings"] if f["rule_id"] == "CFG001")
+    assert cfg001["affected_hosts"] == [glob_alias, negated_alias]
+    assert any(f"ssh -G {glob_alias}" in rem for rem in cfg001["manual_remediation"])
+
+
+_KEY_BLOB_HOST_SALT = "host+IKuUgBlGozMIKWLmx69tm8="
+"""A valid (20-byte-decoding) known_hosts hash salt chosen so it starts with
+the literal 'host' immediately followed by '+' -- i.e. with a non-word
+character on both sides -- to exercise the boundary that the per-literal
+substitution regex also uses for a bare registered host name."""
+_HASHED_TOKEN_WITH_HOST_SALT = f"|1|{_KEY_BLOB_HOST_SALT}|QkJCQkJCQkJCQkJCQkJCQkJCQkI="
+
+
+def test_redact_hashed_known_hosts_token_not_corrupted_by_unrelated_host_alias(
+    fake_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression (#1868 review finding 3): a hashed '|1|...' known_hosts
+    token must never be altered by text substitution, even when its
+    salt/hash coincidentally contains another registered host's bare name
+    as a boundary-matching substring.
+
+    Given ssh config 'Host host' (registers alias host-1 for the bare name
+    'host') and known_hosts with two identical hashed tokens whose salt
+    starts with 'host+' (different key blobs, so KHS002 fires and its
+    title/affected_hosts embed the raw hashed token),
+    when scanning with --redact all,
+    then the hashed token is byte-for-byte unchanged in both affected_hosts
+    and the title -- 'host' is not replaced with 'host-1' inside it.
+    """
+    ssh_dir = fake_home / ".ssh"
+    config_path = ssh_dir / "config"
+    known_hosts_path = ssh_dir / "known_hosts"
+
+    config_path.write_text("Host host\n    IdentityFile ~/.ssh/id_canary\n")
+    known_hosts_path.write_text(
+        f"{_HASHED_TOKEN_WITH_HOST_SALT} ssh-ed25519 {_KEY_BLOB_A}\n"
+        f"{_HASHED_TOKEN_WITH_HOST_SALT} ssh-ed25519 {_KEY_BLOB_B}\n"
+    )
+
+    rc = main(
+        [
+            "scan",
+            "--format",
+            "json",
+            "--no-agent",
+            "--redact",
+            "all",
+            "--ssh-dir",
+            str(ssh_dir),
+            "--config",
+            str(config_path),
+        ]
+    )
+    assert rc == ExitCode.OK
+    data = json.loads(capsys.readouterr().out)
+
+    host_binding = next(hb for hb in data["host_bindings"] if hb["identity_references"])
+    (config_alias,) = host_binding["patterns"]
+    assert config_alias == "host-1"
+
+    khs002 = next(f for f in data["findings"] if f["rule_id"] == "KHS002")
+    assert khs002["affected_hosts"] == [_HASHED_TOKEN_WITH_HOST_SALT]
+    assert khs002["title"] == (
+        f"Conflicting known_hosts key for {_HASHED_TOKEN_WITH_HOST_SALT} (ssh-ed25519)"
+    )
+
+
+def test_redact_known_hosts_port_like_host_name_stays_consistent(
+    fake_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression (#1868 review finding 2): a host whose name is literally a
+    port-looking number must not have the port in its own '[host]:port'
+    known_hosts form corrupted by a second, ambiguous substitution of the
+    same literal.
+
+    Given ssh config 'Host 2222' and known_hosts with two '[2222]:2222'
+    lines (different fingerprints, so KHS002 fires),
+    when scanning with --redact all,
+    then the finding's title and affected_hosts both read
+    '[host-N]:2222' -- the port digits are never themselves replaced with
+    the host alias.
+    """
+    ssh_dir = fake_home / ".ssh"
+    config_path = ssh_dir / "config"
+    known_hosts_path = ssh_dir / "known_hosts"
+
+    config_path.write_text("Host 2222\n    IdentityFile ~/.ssh/id_canary\n")
+    known_hosts_path.write_text(
+        f"[2222]:2222 ssh-ed25519 {_KEY_BLOB_A}\n[2222]:2222 ssh-ed25519 {_KEY_BLOB_B}\n"
+    )
+
+    rc = main(
+        [
+            "scan",
+            "--format",
+            "json",
+            "--no-agent",
+            "--redact",
+            "all",
+            "--ssh-dir",
+            str(ssh_dir),
+            "--config",
+            str(config_path),
+        ]
+    )
+    assert rc == ExitCode.OK
+    data = json.loads(capsys.readouterr().out)
+
+    host_binding = next(hb for hb in data["host_bindings"] if hb["identity_references"])
+    (config_alias,) = host_binding["patterns"]
+    assert re.fullmatch(r"host-\d+", config_alias)
+
+    khs002 = next(f for f in data["findings"] if f["rule_id"] == "KHS002")
+    assert khs002["affected_hosts"] == [f"[{config_alias}]:2222"]
+    assert khs002["title"] == f"Conflicting known_hosts key for [{config_alias}]:2222 (ssh-ed25519)"
