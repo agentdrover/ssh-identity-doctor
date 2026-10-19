@@ -534,3 +534,60 @@ def test_redact_path_alias_not_corrupted_by_unrelated_host_named_like_alias(
     assert cfg001["title"] == f"Unresolved IdentityFile: {path_alias}"
     assert path_alias in cfg001["summary"]
     assert cfg001["manual_remediation"][0] == f"ls -l {path_alias}"
+
+
+def test_redact_path_alias_shared_for_relative_identity_file_value(
+    fake_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression (#1908 critic finding, cycle 2): an IdentityFile value with
+    no '~/' prefix (a bare relative filename, resolved against ssh_dir per
+    references._expand, not HOME) must canonicalize to the very same alias
+    as the matching, already-expanded LocalReference.path -- the earlier fix
+    for the raw-vs-expanded mismatch only canonicalized the '~/...' form
+    (sdd-spec #1908 AC-1), leaving this relative form unmerged (two aliases
+    for one file: the host name itself still doesn't leak, but
+    host_bindings.identity_references and local_references/findings.evidence
+    disagree about this key's alias).
+
+    Given 'Host bridge.example.com' with IdentityFile 'id_bridge.example.com'
+    (no leading '~/' or '/', missing file) and the default --ssh-dir
+    (fake_home/.ssh, so relative resolution and HOME resolution agree on the
+    directory -- isolating this from the ssh_dir-only... case),
+    when scanning with --redact all,
+    then host_bindings.identity_references[0] equals local_references[0].path
+    equals the CFG001 finding's evidence detail -- one alias everywhere.
+    """
+    ssh_dir = fake_home / ".ssh"
+    config_path = ssh_dir / "config"
+    config_path.write_text("Host bridge.example.com\n    IdentityFile id_bridge.example.com\n")
+
+    rc = main(
+        [
+            "scan",
+            "--format",
+            "json",
+            "--no-agent",
+            "--redact",
+            "all",
+            "--ssh-dir",
+            str(ssh_dir),
+            "--config",
+            str(config_path),
+        ]
+    )
+    assert rc == ExitCode.OK
+    out = capsys.readouterr().out
+    assert "bridge.example.com" not in out
+    data = json.loads(out)
+
+    host_binding = next(hb for hb in data["host_bindings"] if hb["identity_references"])
+    (id_ref_alias,) = host_binding["identity_references"]
+    assert re.fullmatch(r"~/\.\.\./id_host-\d+-[0-9a-f]{8}", id_ref_alias)
+
+    local_ref = next(ref for ref in data["local_references"] if ref["kind"] == "config_identity")
+    assert local_ref["path"] == id_ref_alias
+
+    cfg001 = next(f for f in data["findings"] if f["rule_id"] == "CFG001")
+    assert cfg001["evidence"][0]["detail"] == id_ref_alias
+    assert cfg001["title"] == f"Unresolved IdentityFile: {id_ref_alias}"

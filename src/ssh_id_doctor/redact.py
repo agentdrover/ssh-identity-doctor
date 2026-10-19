@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from pathlib import Path
 from typing import Literal
 
 from ssh_id_doctor.domain import (
@@ -28,6 +29,7 @@ from ssh_id_doctor.domain import (
     SourceCoverage,
     UnresolvedItem,
 )
+from ssh_id_doctor.references import _expand  # the FR-002 normalization, not a copy
 
 _WORD_CHAR = r"[A-Za-z0-9_]"
 """Used to build a ``\\b``-like boundary around a substituted literal that also
@@ -95,7 +97,13 @@ def _is_known_hosts_finding(f: Finding) -> bool:
 class Redactor:
     """Stateful redactor mapping identifiers to stable sequential pseudonyms."""
 
-    def __init__(self, mode: RedactMode) -> None:
+    def __init__(
+        self,
+        mode: RedactMode,
+        *,
+        home: str | os.PathLike[str] | None = None,
+        ssh_dir: str | os.PathLike[str] | None = None,
+    ) -> None:
         self.mode = mode
         self.redact_hosts = mode in ("hosts", "all")
         self.redact_paths = mode in ("paths", "all")
@@ -106,6 +114,22 @@ class Redactor:
         self._path_map: dict[str, str] = {}
         self._path_alias_by_canonical: dict[str, str] = {}
         self._known_hosts_token_map: dict[str, str] = {}
+
+        # Mirror references.resolve_identity_references' own home/ssh_dir
+        # normalization (realpath, ssh_dir defaults to home/.ssh) exactly, so
+        # that _canonical_path (below) expands a raw, unexpanded config value
+        # (HostBinding.identity_references) to the very same string as the
+        # already-expanded one references.py produced for the matching
+        # LocalReference -- not just for the '~/...' form, but also for a
+        # relative IdentityFile value (resolved against ssh_dir, not HOME).
+        home_str = os.fspath(home) if home is not None else os.environ.get("HOME")
+        self._home_path: Path | None = Path(os.path.realpath(home_str)) if home_str else None
+        if ssh_dir is not None:
+            self._ssh_dir_path: Path | None = Path(os.path.realpath(os.fspath(ssh_dir)))
+        elif self._home_path is not None:
+            self._ssh_dir_path = self._home_path / ".ssh"
+        else:
+            self._ssh_dir_path = None
 
     def get_host_alias(self, host: str) -> str:
         if not host:
@@ -156,15 +180,17 @@ class Redactor:
         self._path_map[path] = alias
         return alias
 
-    @staticmethod
-    def _canonical_path(path: str) -> str:
+    def _canonical_path(self, path: str) -> str:
         """Normalize a path for alias deduplication only (never for display):
-        expand a leading ``~`` the same way ``references._expand`` does (both
-        ultimately key off ``$HOME``), then ``normpath``, so an unexpanded
-        config value and its already-expanded counterpart collapse to one
-        canonical string and thus one alias."""
-        expanded = os.path.expanduser(path) if path.startswith("~") else path
-        return os.path.normpath(expanded)
+        run it through the exact same ``references._expand`` call (and the
+        same realpath'd home/ssh_dir) that ``resolve_identity_references``
+        used to build ``LocalReference.path``, so an unexpanded config value
+        (``HostBinding.identity_references``) and its already-expanded
+        counterpart collapse to one canonical string and thus one alias --
+        not only for a ``~/...`` value (keyed off HOME), but also for a bare
+        relative one (keyed off ssh_dir, which is not HOME/.ssh whenever
+        ``--ssh-dir`` points elsewhere)."""
+        return str(_expand(path, self._home_path, self._ssh_dir_path))
 
     def register_known_hosts_token(self, token: str) -> str:
         """Register one known_hosts(5) host token from a KHS-rule Finding's
@@ -252,9 +278,21 @@ class Redactor:
         return pattern.sub(lambda m: replacements[m.group(0)], text)
 
 
-def redact(snapshot: ScanSnapshot, mode: RedactMode) -> ScanSnapshot:
-    """Transform snapshot by redacting sensitive data according to mode."""
-    redactor = Redactor(mode)
+def redact(
+    snapshot: ScanSnapshot,
+    mode: RedactMode,
+    *,
+    home: str | os.PathLike[str] | None = None,
+    ssh_dir: str | os.PathLike[str] | None = None,
+) -> ScanSnapshot:
+    """Transform snapshot by redacting sensitive data according to mode.
+
+    ``home``/``ssh_dir`` should be the same values the scan itself used (FR-002)
+    so that a raw, unexpanded path (e.g. a HostBinding's IdentityFile value)
+    canonicalizes to the same alias as the already-expanded path computed for
+    it elsewhere in the snapshot (sdd-spec #1908).
+    """
+    redactor = Redactor(mode, home=home, ssh_dir=ssh_dir)
 
     # 1. Pre-register hosts and users from host bindings, before any path is
     # aliased: get_path_alias redacts a registered host/user name out of a

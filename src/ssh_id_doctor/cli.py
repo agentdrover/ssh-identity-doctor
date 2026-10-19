@@ -241,7 +241,7 @@ def _run_scan(args: argparse.Namespace) -> int:
         return ExitCode.REQUIRED_SCAN_FAILED
 
     if args.redact:
-        snapshot = redact(snapshot, args.redact)
+        snapshot = redact(snapshot, args.redact, home=home, ssh_dir=ssh_dir_path)
 
     fmt = args.format
     if fmt == "json":
@@ -351,7 +351,7 @@ def _run_rotation_plan(args: argparse.Namespace) -> int:
         return ExitCode.INVALID_ARGS
 
     if args.redact:
-        snapshot = redact(snapshot, args.redact)
+        snapshot = redact(snapshot, args.redact, home=home, ssh_dir=ssh_dir_path)
 
     plan = build_rotation_plan(snapshot, args.fingerprint)
 
@@ -460,7 +460,7 @@ def _run_explain(args: argparse.Namespace) -> int:
         return ExitCode.INVALID_ARGS
 
     if args.redact:
-        snapshot = redact(snapshot, args.redact)
+        snapshot = redact(snapshot, args.redact, home=home, ssh_dir=ssh_dir_path)
         target_finding = next(f for f in snapshot.findings if f.id == args.finding_id)
 
     explanation = explain_finding(target_finding)
