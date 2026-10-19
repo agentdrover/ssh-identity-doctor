@@ -46,6 +46,50 @@ def _boundary_pattern(literal: str) -> str:
 
 RedactMode = Literal["hosts", "paths", "all"]
 
+_BRACKET_PORT_RE = re.compile(r"^\[(.+)\]:(\d+)$")
+
+
+def _strip_known_hosts_negation(token: str) -> tuple[str, str]:
+    """Split a known_hosts host token into its ``!`` negation prefix (if any) and
+    the rest, without touching hashed ``|1|`` tokens (callers check those first)."""
+    return ("!", token[1:]) if token.startswith("!") else ("", token)
+
+
+def _known_hosts_alias_target(token: str) -> str | None:
+    """The substring of a known_hosts host token to register/alias, or ``None``
+    if the token must never be aliased (a hashed ``|1|`` entry stays as-is).
+
+    Strips ``!`` negation and the ``[host]:port`` bracket wrapper so a
+    known_hosts ``[host]:port`` entry shares its pseudonym with the same host
+    written bare, e.g. an ssh config Host line (sdd-spec #1868).
+    """
+    if token.startswith("|1|"):
+        return None
+    _, rest = _strip_known_hosts_negation(token)
+    if not rest:
+        return None
+    match = _BRACKET_PORT_RE.match(rest)
+    return match.group(1) if match else rest
+
+
+def _redact_known_hosts_host_token(redactor: Redactor, token: str) -> str:
+    """Redact one Finding.affected_hosts token for display.
+
+    A hashed ``|1|`` token is returned unchanged; a ``!host`` or
+    ``[host]:port`` form keeps its negation/brackets/port but aliases the
+    host part, so the display matches ``get_host_alias`` for the same host
+    written bare (sdd-spec #1868).
+    """
+    if token.startswith("|1|"):
+        return token
+    prefix, rest = _strip_known_hosts_negation(token)
+    if not rest:
+        return token
+    match = _BRACKET_PORT_RE.match(rest)
+    if match:
+        return f"{prefix}[{redactor.get_host_alias(match.group(1))}]:{match.group(2)}"
+    return f"{prefix}{redactor.get_host_alias(rest)}"
+
 
 class Redactor:
     """Stateful redactor mapping identifiers to stable sequential pseudonyms."""
@@ -144,14 +188,14 @@ def redact(snapshot: ScanSnapshot, mode: RedactMode) -> ScanSnapshot:
                 redactor.get_user_alias(hb.user)
         for f in snapshot.findings:
             for h in f.affected_hosts:
-                redactor.get_host_alias(h)
+                target = _known_hosts_alias_target(h)
+                if target is not None:
+                    redactor.get_host_alias(target)
         for kh in snapshot.known_hosts:
             for token in kh.hosts:
-                if token.startswith("|1|"):
-                    continue
-                candidate = token[1:] if token.startswith("!") else token
-                if candidate:
-                    redactor.get_host_alias(candidate)
+                target = _known_hosts_alias_target(token)
+                if target is not None:
+                    redactor.get_host_alias(target)
 
     # Transform HostBindings
     new_host_bindings: list[HostBinding] = []
@@ -289,7 +333,7 @@ def redact(snapshot: ScanSnapshot, mode: RedactMode) -> ScanSnapshot:
             )
 
         aff_hosts = (
-            tuple(redactor.get_host_alias(h) for h in f.affected_hosts)
+            tuple(_redact_known_hosts_host_token(redactor, h) for h in f.affected_hosts)
             if redactor.redact_hosts
             else f.affected_hosts
         )

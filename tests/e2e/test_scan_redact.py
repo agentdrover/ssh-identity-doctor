@@ -163,3 +163,66 @@ def test_redact_known_hosts_names(
     for item in data_paths["unresolved"]:
         assert raw_path not in item["source_file"]
         assert item["source_file"].startswith("~/")
+
+
+_KEY_BLOB_A = "AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f"
+_KEY_BLOB_B = "AAAAC3NzaC1lZDI1NTE5AAAAIAMKERgfJi00O0JJUFdeZWxzeoGIj5adpKuyucDHztXc"
+_KEY_BLOB_C = "AAAAC3NzaC1lZDI1NTE5AAAAIMwKQfiW86Yu6eXH3bYIk94OnoidaKLausFeWb3nT/iL"
+_HASHED_TOKEN = "|1|QUFBQUFBQUFBQUFBQUFBQUFBQUE=|QkJCQkJCQkJCQkJCQkJCQkJCQkI="  # noqa: S105
+
+
+def test_redact_known_hosts_port_form_shares_host_alias(
+    fake_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC-1 (#1868): a ssh config Host and the same host's known_hosts
+    '[host]:port' form must share one pseudonym in a masked report, and the
+    host name must not leak through either form, in any format.
+
+    Given ssh config 'Host example.com' and known_hosts with two
+    '[example.com]:2222' lines (different fingerprints, so KHS002 fires and
+    names the host in its title/affected_hosts) plus one hashed '|1|' line,
+    when scanning with --redact hosts/all in terminal/md/json,
+    then 'example.com' never leaks, and the '[host]:port' alias used in the
+    KHS002 finding is the same alias as the ssh config Host binding's.
+    """
+    ssh_dir = fake_home / ".ssh"
+    config_path = ssh_dir / "config"
+    known_hosts_path = ssh_dir / "known_hosts"
+
+    config_path.write_text("Host example.com\n    IdentityFile ~/.ssh/id_canary\n")
+    known_hosts_path.write_text(
+        f"[example.com]:2222 ssh-ed25519 {_KEY_BLOB_A}\n"
+        f"[example.com]:2222 ssh-ed25519 {_KEY_BLOB_B}\n"
+        f"{_HASHED_TOKEN} ssh-ed25519 {_KEY_BLOB_C}\n"
+    )
+
+    base_args = [
+        "--no-agent",
+        "--ssh-dir",
+        str(ssh_dir),
+        "--config",
+        str(config_path),
+    ]
+
+    for mode in ("hosts", "all"):
+        for fmt in ("terminal", "md", "json"):
+            rc = main(["scan", "--format", fmt, "--redact", mode, *base_args])
+            assert rc == ExitCode.OK
+            out = capsys.readouterr().out
+            assert "example.com" not in out
+            assert "[example.com]:2222" not in out
+
+    rc_json = main(["scan", "--format", "json", "--redact", "all", *base_args])
+    assert rc_json == ExitCode.OK
+    data = json.loads(capsys.readouterr().out)
+
+    host_binding = next(hb for hb in data["host_bindings"] if hb["identity_references"])
+    (config_alias,) = host_binding["patterns"]
+    assert re.fullmatch(r"host-\d+", config_alias)
+
+    khs002 = next(f for f in data["findings"] if f["rule_id"] == "KHS002")
+    match = re.fullmatch(r"\[(host-\d+)\]:2222", khs002["affected_hosts"][0])
+    assert match is not None
+    assert match.group(1) == config_alias
+    assert khs002["title"] == f"Conflicting known_hosts key for [{config_alias}]:2222 (ssh-ed25519)"
