@@ -29,7 +29,10 @@ from ssh_id_doctor.domain import (
     SourceCoverage,
     UnresolvedItem,
 )
-from ssh_id_doctor.references import _expand  # the FR-002 normalization, not a copy
+from ssh_id_doctor.references import (
+    _TOKEN_RE,  # the same unresolved-token detector references.py itself uses
+    _expand,  # the FR-002 normalization, not a copy
+)
 
 _WORD_CHAR = r"[A-Za-z0-9_]"
 """Used to build a ``\\b``-like boundary around a substituted literal that also
@@ -181,16 +184,40 @@ class Redactor:
         return alias
 
     def _canonical_path(self, path: str) -> str:
-        """Normalize a path for alias deduplication only (never for display):
-        run it through the exact same ``references._expand`` call (and the
-        same realpath'd home/ssh_dir) that ``resolve_identity_references``
+        """Normalize a path for alias deduplication only (never for display).
+
+        First mirrors references.resolve_identity_references' own raw-value
+        preprocessing: strip surrounding whitespace and a matching pair of
+        double quotes (an ``IdentityFile " ~/.ssh/id_x "`` value is stripped
+        before ``_expand`` ever sees it there too) -- otherwise a
+        HostBinding's raw identity_references spelling and the LocalReference
+        computed for the very same entry would canonicalize differently and
+        get two different aliases.
+
+        Then, only when the (stripped) value still carries an unresolved
+        token (``%h``/``%r``/``%d``/``%u``/``${VAR}``): keep it as its own
+        literal identity instead of running it through ``_expand``. A token
+        is never actually a LocalReference (references.py reports it as
+        UnresolvedItem instead, precisely because its value is unknown), and
+        ``_expand``'s ``os.path.normpath`` would otherwise silently cancel a
+        literal ``..`` against the token as if it were one path segment --
+        wrong whenever the token's real expansion has more than one segment,
+        and able to collapse two genuinely different files onto one alias.
+
+        Otherwise, run it through the exact same ``references._expand`` call
+        (and the same realpath'd home/ssh_dir) that ``resolve_identity_references``
         used to build ``LocalReference.path``, so an unexpanded config value
-        (``HostBinding.identity_references``) and its already-expanded
-        counterpart collapse to one canonical string and thus one alias --
-        not only for a ``~/...`` value (keyed off HOME), but also for a bare
-        relative one (keyed off ssh_dir, which is not HOME/.ssh whenever
-        ``--ssh-dir`` points elsewhere)."""
-        return str(_expand(path, self._home_path, self._ssh_dir_path))
+        and its already-expanded counterpart collapse to one canonical string
+        and thus one alias -- not only for a ``~/...`` value (keyed off HOME),
+        but also for a bare relative one (keyed off ssh_dir, which is not
+        HOME/.ssh whenever ``--ssh-dir`` points elsewhere).
+        """
+        raw = path.strip()
+        if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
+            raw = raw[1:-1]
+        if _TOKEN_RE.search(raw):
+            return raw
+        return str(_expand(raw, self._home_path, self._ssh_dir_path))
 
     def register_known_hosts_token(self, token: str) -> str:
         """Register one known_hosts(5) host token from a KHS-rule Finding's

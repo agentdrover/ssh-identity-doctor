@@ -404,28 +404,34 @@ def test_redact_hides_host_name_inside_key_file_name(
     ``get_path_alias`` only hashed the full path and kept the basename as-is.
 
     Given ssh config 'Host bridge.example.com' with IdentityFile
-    '~/.ssh/id_bridge.example.com' (missing) and a second Host whose
-    IdentityFile is '~/.ssh/archive/id_bridge.example.com' -- a different
-    full path sharing the same basename,
+    '~/.ssh/id_bridge.example.com' (missing), a second Host whose
+    IdentityFile is the absolute '<ssh_dir>/archive/id_bridge.example.com'
+    (missing too) -- a different full path sharing the same basename -- and
+    an 'Include' of that same absolute archive path (which also resolves to
+    nothing, since the file is missing and the pattern has no wildcard, so
+    it becomes an 'include_missing' unresolved item naming that same path),
     when scanning with --redact all in terminal/md/json,
     then 'bridge.example.com' never leaks (not even via the file name), the
-    path alias is the same alias everywhere it is rendered in the JSON
-    (host_bindings, findings, local_references) -- including between
-    HostBinding.identity_references (the raw, unexpanded '~/...' value as
-    written in the config) and LocalReference.path / finding evidence for
-    the very same IdentityFile (the expanded absolute form) -- and the two
-    paths that share a basename get two different aliases.
+    path alias is the same alias everywhere it is rendered in the JSON --
+    host_bindings, findings (evidence/title), local_references, AND
+    unresolved (#1908 critic cycle 1, P2) -- including between
+    HostBinding.identity_references (the raw, unexpanded value as written in
+    the config) and LocalReference.path / finding evidence for the very same
+    IdentityFile (the expanded absolute form) -- and the two paths that
+    share a basename get two different aliases.
     """
     ssh_dir = fake_home / ".ssh"
     config_path = ssh_dir / "config"
     archive_dir = ssh_dir / "archive"
     archive_dir.mkdir()
+    archive_identity_path = str(archive_dir / "id_bridge.example.com")
 
     config_path.write_text(
         "Host bridge.example.com\n"
         "    IdentityFile ~/.ssh/id_bridge.example.com\n"
         "Host old-bridge.example.com\n"
-        "    IdentityFile ~/.ssh/archive/id_bridge.example.com\n"
+        f"    IdentityFile {archive_identity_path}\n"
+        f"Include {archive_identity_path}\n"
     )
 
     base_args = [
@@ -473,6 +479,28 @@ def test_redact_hides_host_name_inside_key_file_name(
     # they must resolve to the same alias (#1908 critic finding 1).
     for hb_line, alias in hb_alias_by_source_line.items():
         assert local_refs_by_line[hb_line + 1] == alias
+
+    # CFG001 findings (one per missing IdentityFile): evidence detail and
+    # title use that very same alias too (#1908 critic cycle 1, P2 -- the
+    # AC's "findings" place of consistency, not just host_bindings/
+    # local_references).
+    cfg001_findings = [f for f in data["findings"] if f["rule_id"] == "CFG001"]
+    assert len(cfg001_findings) == 2
+    cfg001_by_line = {f["evidence"][0]["line"]: f for f in cfg001_findings}
+    assert len(cfg001_by_line) == 2
+    for hb_line, alias in hb_alias_by_source_line.items():
+        finding = cfg001_by_line[hb_line + 1]
+        assert finding["evidence"][0]["detail"] == alias
+        assert finding["title"] == f"Unresolved IdentityFile: {alias}"
+
+    # unresolved: the Include of the very same archive path (a non-glob
+    # pattern that resolves to nothing) is reported as an 'include_missing'
+    # unresolved item naming that path -- it must get that path's one alias
+    # too, not a fresh one (the AC's "unresolved" place of consistency).
+    archive_alias = local_refs_by_line[4]
+    include_missing = [u for u in data["unresolved"] if u["kind"] == "include_missing"]
+    assert len(include_missing) == 1
+    assert include_missing[0]["detail"] == archive_alias
 
 
 def test_redact_path_alias_not_corrupted_by_unrelated_host_named_like_alias(
@@ -591,3 +619,118 @@ def test_redact_path_alias_shared_for_relative_identity_file_value(
     cfg001 = next(f for f in data["findings"] if f["rule_id"] == "CFG001")
     assert cfg001["evidence"][0]["detail"] == id_ref_alias
     assert cfg001["title"] == f"Unresolved IdentityFile: {id_ref_alias}"
+
+
+def test_redact_path_alias_not_merged_across_unresolved_token(
+    fake_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression (#1908 critic cycle 1, P1#1): a path alias must never merge
+    two paths across an unexpanded token (``${VAR}``/``%h``/etc.) just
+    because ``os.path.normpath`` happens to cancel a literal ``..`` against
+    the token as if it were one path segment.
+
+    Given 'Host bridge.example.com' with IdentityFile
+    '~/.ssh/id_bridge.example.com' (plain, missing) and a second Host whose
+    IdentityFile is '~/.ssh/${KEY_DIR}/../id_bridge.example.com' (token-
+    bearing: if KEY_DIR were e.g. 'team/prod' this would name a different
+    file, so its real identity is unknown and must never be treated as
+    identical to the plain path's just because naive normpath cancels
+    '${KEY_DIR}/..' to nothing),
+    when scanning with --redact all,
+    then the two get two different aliases, and the token-bearing one is
+    reported in 'unresolved' (never as a LocalReference, since
+    references.py deliberately never resolves a token) with that same
+    (distinct) alias in its detail.
+    """
+    ssh_dir = fake_home / ".ssh"
+    config_path = ssh_dir / "config"
+    config_path.write_text(
+        "Host bridge.example.com\n"
+        "    IdentityFile ~/.ssh/id_bridge.example.com\n"
+        "Host token-bridge.example.com\n"
+        "    IdentityFile ~/.ssh/${KEY_DIR}/../id_bridge.example.com\n"
+    )
+
+    rc = main(
+        [
+            "scan",
+            "--format",
+            "json",
+            "--no-agent",
+            "--redact",
+            "all",
+            "--ssh-dir",
+            str(ssh_dir),
+            "--config",
+            str(config_path),
+        ]
+    )
+    assert rc == ExitCode.OK
+    data = json.loads(capsys.readouterr().out)
+
+    alias_re = re.compile(r"~/\.\.\./id_host-\d+-[0-9a-f]{8}")
+    hb_plain = next(hb for hb in data["host_bindings"] if hb["source_line"] == 1)
+    hb_token = next(hb for hb in data["host_bindings"] if hb["source_line"] == 3)
+    (plain_alias,) = hb_plain["identity_references"]
+    (token_alias,) = hb_token["identity_references"]
+    assert alias_re.fullmatch(plain_alias)
+    assert alias_re.fullmatch(token_alias)
+    assert plain_alias != token_alias
+
+    assert len(data["unresolved"]) == 1
+    (unresolved_item,) = data["unresolved"]
+    assert unresolved_item["kind"] == "unresolved_token"
+    assert unresolved_item["detail"] == token_alias
+
+
+def test_redact_path_alias_shared_across_whitespace_and_quoting(
+    fake_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression (#1908 critic cycle 1, P1#2): references.resolve_identity_references
+    strips surrounding whitespace (and a matching pair of double quotes) from
+    an IdentityFile value before expanding it; path-alias canonicalization
+    must mirror that exact preprocessing, or a HostBinding's raw
+    identity_references spelling disagrees with the LocalReference/finding
+    evidence alias for the very same entry.
+
+    Given two Host blocks whose IdentityFile values both name the same real
+    file, one plain ('~/.ssh/id_bridge.example.com') and one with leading/
+    trailing whitespace inside a quoted value ('" ~/.ssh/id_bridge.example.com "'),
+    when scanning with --redact all,
+    then both HostBinding.identity_references entries get the very same
+    alias.
+    """
+    ssh_dir = fake_home / ".ssh"
+    config_path = ssh_dir / "config"
+    config_path.write_text(
+        "Host bridge.example.com\n"
+        "    IdentityFile ~/.ssh/id_bridge.example.com\n"
+        "Host whitespace-bridge.example.com\n"
+        '    IdentityFile " ~/.ssh/id_bridge.example.com "\n'
+    )
+
+    rc = main(
+        [
+            "scan",
+            "--format",
+            "json",
+            "--no-agent",
+            "--redact",
+            "all",
+            "--ssh-dir",
+            str(ssh_dir),
+            "--config",
+            str(config_path),
+        ]
+    )
+    assert rc == ExitCode.OK
+    data = json.loads(capsys.readouterr().out)
+
+    hb_plain = next(hb for hb in data["host_bindings"] if hb["source_line"] == 1)
+    hb_quoted = next(hb for hb in data["host_bindings"] if hb["source_line"] == 3)
+    (plain_alias,) = hb_plain["identity_references"]
+    (quoted_alias,) = hb_quoted["identity_references"]
+    assert re.fullmatch(r"~/\.\.\./id_host-\d+-[0-9a-f]{8}", plain_alias)
+    assert quoted_alias == plain_alias
