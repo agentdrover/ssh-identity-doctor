@@ -194,6 +194,46 @@ def deny_open(open_guard: OpenGuard, monkeypatch: pytest.MonkeyPatch) -> DenyOpe
     return _deny
 
 
+DenyOpenInDir = Callable[[str | os.PathLike[str]], contextlib.AbstractContextManager[None]]
+"""A context manager factory: inside it, ``os.open`` for any path inside one
+directory raises ``PermissionError``, as if that directory's permissions denied
+writes into it."""
+
+
+@pytest.fixture
+def deny_open_in_dir(open_guard: OpenGuard, monkeypatch: pytest.MonkeyPatch) -> DenyOpenInDir:
+    """Make a context manager that denies ``os.open`` for any path under one directory (EACCES).
+
+    Stands in for ``mkdir(dir, mode=0o555)``: under root, a directory's write-permission
+    bits do not stop file creation inside it, so a test relying on an unwritable directory
+    to make ``tempfile.mkstemp`` fail (as ``output.write_report_atomically`` does) is
+    false-green as root and fails as it (SID #1860). This patches the syscall the
+    product's writer uses to create its temp file (``os.open``, called by
+    ``tempfile.mkstemp``) for any candidate under the given directory — matched by
+    parent directory, since ``mkstemp``'s random file name is not known ahead of
+    time — so the test exercises the same behaviour for any user. Like ``deny_open``,
+    reads the CURRENT ``os.open`` only when entered, so other paths still go through
+    the open guard instead of bypassing it.
+    """
+
+    @contextlib.contextmanager
+    def _deny(directory: str | os.PathLike[str]) -> Iterator[None]:
+        target_dir = os.path.realpath(os.fspath(directory))
+        current_os_open = os.open
+
+        def denied_open(candidate: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+            candidate_path = os.fspath(candidate)
+            if os.path.realpath(os.path.dirname(candidate_path)) == target_dir:
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), candidate_path)
+            return current_os_open(candidate, flags, *args, **kwargs)
+
+        with monkeypatch.context() as ctx:
+            ctx.setattr(os, "open", denied_open)
+            yield
+
+    return _deny
+
+
 @pytest.fixture
 def fake_home(_isolated_home: Path) -> Path:
     """Synthetic HOME with .ssh/{id_canary, id_canary.pub, config}. Returns HOME."""
