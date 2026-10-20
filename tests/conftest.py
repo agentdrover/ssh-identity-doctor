@@ -25,6 +25,7 @@ import contextlib
 import errno
 import io
 import os
+import stat
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -68,12 +69,34 @@ class OpenGuard:
         parent's real path recorded when its own fd was opened with
         ``O_DIRECTORY`` (see ``guarded_os_open`` below); unknown ``dir_fd``
         falls back to resolving against the CWD, same as before.
+
+        Critic finding (cycle 1): a plain lexical join of the parent's real
+        path and ``raw`` is only correct while ``raw`` is not itself a
+        symlink. If an ancestor component was swapped for one -- exactly the
+        bypass task #1802 exists to refuse -- the thing actually named lives
+        wherever that symlink points, not at the pre-swap lexical location;
+        every caller of this method (the protected-path check below,
+        ``opened_paths``, ``deny_open``) would keep reporting the old,
+        safe-looking path and silently miss a real bypass. So check first,
+        via ``os.lstat`` with ``dir_fd``, whether ``raw`` is currently a
+        symlink and, if so, follow it with ``os.readlink`` (which also takes
+        ``dir_fd``) and resolve that target for real, instead of assuming it
+        still names what the lexical join implies.
         """
         raw = os.fsdecode(os.fspath(path))
         parent = self.dir_fd_realpath.get(dir_fd)
         if parent is None:
             return os.path.realpath(raw)
-        return os.path.normpath(os.path.join(parent, raw))
+        try:
+            is_symlink = stat.S_ISLNK(os.lstat(raw, dir_fd=dir_fd).st_mode)
+        except OSError:
+            is_symlink = False
+        if not is_symlink:
+            return os.path.normpath(os.path.join(parent, raw))
+        target = os.readlink(raw, dir_fd=dir_fd)
+        if not os.path.isabs(target):
+            target = os.path.join(parent, target)
+        return os.path.realpath(target)
 
     def guard_root(self, *roots: str | os.PathLike[str]) -> None:
         """Protect another synthetic HOME with the same rules as ``home``.

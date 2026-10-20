@@ -270,3 +270,52 @@ def test_component_open_leaks_no_descriptors(
         os.close(dir_fd)
     assert len(open_guard.violations) == 1
     open_guard.violations.clear()  # deliberate violation; do not fail teardown
+
+
+def test_dir_fd_tracking_reports_the_real_target_of_a_followed_symlink(
+    tmp_path: Path,
+    open_guard: OpenGuard,
+    opened_paths: list[str],
+) -> None:
+    """Positive control for the tracking the ancestor-swap test above relies on
+    (critic cycle 1): if a dir_fd-relative open ever did follow a swapped
+    ancestor -- the one thing fs.py's O_NOFOLLOW exists to prevent -- the
+    harness's own path tracking (``OpenGuard.resolve_relative``, which
+    ``opened_paths`` and ``deny_open`` both build on) must report where it
+    actually landed, not the pre-swap, lexically-expected location; otherwise
+    a real future regression could pass ``test_a_swapped_ancestor_directory_
+    is_never_followed`` for the wrong reason (opened_paths "happens" to not
+    contain a path that was never computed correctly in the first place).
+    This opens through the symlink directly, without O_NOFOLLOW -- the
+    product never does this; it is here purely to prove the tracking itself
+    is sound, independent of fs.py's own refusal.
+    """
+    root = tmp_path / "root"
+    inner = root / "inner"
+    inner.mkdir(parents=True)
+    open_guard.guard_root(root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "leaf").write_text(OUTSIDE_MARKER)
+
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        # Swap "inner" for a symlink to "outside" -- exactly the bypass AC-1
+        # proves fs.py refuses; simulated directly here to validate the harness.
+        inner.rmdir()
+        os.symlink(outside, inner)
+
+        opened_paths.clear()
+        inner_fd = os.open("inner", os.O_RDONLY | os.O_DIRECTORY, dir_fd=root_fd)
+        try:
+            os.close(os.open("leaf", os.O_RDONLY, dir_fd=inner_fd))
+        finally:
+            os.close(inner_fd)
+    finally:
+        os.close(root_fd)
+
+    outside_leaf_real = os.path.realpath(outside / "leaf")
+    assert outside_leaf_real in opened_paths, (
+        "the tracking helper must report the real, post-symlink target, "
+        "not a pre-swap lexical guess"
+    )
