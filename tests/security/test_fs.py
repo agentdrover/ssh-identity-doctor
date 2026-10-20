@@ -7,8 +7,6 @@ applied to one ssh_config(5) file.
 
 from __future__ import annotations
 
-import builtins
-import io
 import os
 import stat
 import traceback
@@ -21,28 +19,6 @@ from conftest import CANARY, CANARY_PRIVATE_KEY, DenyOpen, OpenGuard
 from ssh_id_doctor import fs
 from ssh_id_doctor.domain import Resolution
 from ssh_id_doctor.fs import NotAConfigFile, NotAKnownHostsFile, PrivateKeyAccessDenied
-
-
-@pytest.fixture
-def opened_paths(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Every path opened (for any mode) while the test runs."""
-    seen: list[str] = []
-    inner_open = builtins.open
-    inner_os_open = os.open
-
-    def recording_open(file: Any, *args: Any, **kwargs: Any) -> Any:
-        if not isinstance(file, int):
-            seen.append(os.path.realpath(os.fspath(file)))
-        return inner_open(file, *args, **kwargs)
-
-    def recording_os_open(path: Any, *args: Any, **kwargs: Any) -> int:
-        seen.append(os.path.realpath(os.fspath(path)))
-        return inner_os_open(path, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "open", recording_open)
-    monkeypatch.setattr(io, "open", recording_open)
-    monkeypatch.setattr(os, "open", recording_os_open)
-    return seen
 
 
 def _snapshot(root: Path) -> dict[str, tuple[int, int]]:

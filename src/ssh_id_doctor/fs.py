@@ -26,6 +26,14 @@ as given and after resolving symlinks), and like discovery it refuses a
 target whose real location leaves ``ssh_dir`` via :func:`resolve_within`.
 Otherwise it follows :func:`read_config_text`: regular-file check before
 `open`, then a size limit and a private-key header check after reading.
+
+All three open the checked real path through :func:`_open_through_components`
+(task #1802), not a single ``os.open(real, O_NOFOLLOW)``: that single call only
+refuses a symlink on the file itself, leaving a window between the checks above
+and the open in which an *ancestor* directory can be swapped for a symlink out
+of the checked location. Walking from ``/`` one component at a time, each via
+its parent's directory fd with its own ``O_NOFOLLOW``, closes that window at
+every step, not just the last.
 """
 
 from __future__ import annotations
@@ -129,6 +137,34 @@ def resolve_within(
     return Path(real), Resolution.RESOLVED
 
 
+def _open_through_components(real_path: Path, *, final_flags: int) -> int:
+    """Open ``real_path`` — an absolute path with no ``..``, already checked by the
+    caller (:func:`resolve_within` plus a pre-open ``stat``) to be the real location
+    it means to read — one path component at a time from ``/``, each via its
+    parent's own directory fd with ``O_NOFOLLOW``. ``os.open(real_path, O_NOFOLLOW)``
+    alone only refuses a symlink on the *last* component: if an ancestor directory
+    is swapped for a symlink leading outside the checked location between the
+    caller's check and the open, that plain form still follows it. Opening every
+    component through its parent's fd instead makes the same refusal apply at every
+    step, not just the last.
+
+    Returns an fd for the final component, opened with ``final_flags`` (the caller
+    owns it). Every intermediate directory fd is closed — on success, on a
+    mid-walk failure, and if the final ``os.open`` itself fails.
+    """
+    names = real_path.parts[1:]
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    parent_fd = os.open(os.sep, dir_flags)
+    try:
+        for name in names[:-1]:
+            next_fd = os.open(name, dir_flags, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = next_fd
+        return os.open(names[-1], final_flags, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
 def safe_walk(root: str | os.PathLike[str]) -> Iterator[WalkEntry]:
     """List everything under ``root`` without leaving it and without reading files.
 
@@ -174,7 +210,9 @@ def _is_private_key_line(line: bytes) -> bool:
 
 
 def read_public_text(path: str | os.PathLike[str], *, max_bytes: int = MAX_PUBLIC_BYTES) -> str:
-    """Read a public-key file. The only function in the package that opens a file.
+    """Read a public-key file. One of the three reader functions in the package;
+    the actual open of the checked real path is delegated to
+    :func:`_open_through_components`.
 
     Refuses with :class:`PrivateKeyAccessDenied` — before opening — any path
     whose name, or whose symlink target's name, lacks the ``.pub`` suffix; and,
@@ -193,7 +231,16 @@ def read_public_text(path: str | os.PathLike[str], *, max_bytes: int = MAX_PUBLI
     # O_NONBLOCK: should the path be swapped for a FIFO after the check above,
     # the open still returns at once and the fstat below refuses it.
     flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
-    with os.fdopen(os.open(real, flags), "rb") as handle:
+    try:
+        fd = _open_through_components(real, final_flags=flags)
+    except OSError as exc:
+        raise type(exc)(f"{normalized.name!r}: {exc.strerror or type(exc).__name__}") from None
+    try:
+        handle = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+    with handle:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
             raise NotAPublicKeyFile(f"{normalized.name!r} is not a regular file")
         data = handle.read(max_bytes + 1)
@@ -205,7 +252,9 @@ def read_public_text(path: str | os.PathLike[str], *, max_bytes: int = MAX_PUBLI
 
 
 def read_config_text(path: str | os.PathLike[str], *, max_bytes: int = MAX_CONFIG_BYTES) -> str:
-    """Read one ssh_config(5) file. One of two functions in the package that opens a file.
+    """Read one ssh_config(5) file. One of the three reader functions in the package;
+    the actual open of the checked real path is delegated to
+    :func:`_open_through_components`.
 
     Unlike :func:`read_public_text` there is no filename check (a config file
     is usually literally named ``config``, not suffixed). A target that is
@@ -225,7 +274,16 @@ def read_config_text(path: str | os.PathLike[str], *, max_bytes: int = MAX_CONFI
     # O_NONBLOCK: should the path be swapped for a FIFO after the check above,
     # the open still returns at once and the fstat below refuses it.
     flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
-    with os.fdopen(os.open(real, flags), "rb") as handle:
+    try:
+        fd = _open_through_components(real, final_flags=flags)
+    except OSError as exc:
+        raise type(exc)(f"{normalized.name!r}: {exc.strerror or type(exc).__name__}") from None
+    try:
+        handle = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+    with handle:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
             raise NotAConfigFile(f"{normalized.name!r} is not a regular file")
         data = handle.read(max_bytes + 1)
@@ -242,7 +300,9 @@ def read_known_hosts_text(
     ssh_dir: str | os.PathLike[str],
     max_bytes: int = MAX_KNOWN_HOSTS_BYTES,
 ) -> str:
-    """Read one known_hosts(5) file (AC-1). The third of three functions that open a file.
+    """Read one known_hosts(5) file (AC-1). The third of the three reader functions
+    in the package; the actual open of the checked real path is delegated to
+    :func:`_open_through_components`.
 
     Refuses — before any ``open`` — a path whose name is not ``known_hosts``;
     one whose real location, per :func:`resolve_within`, leaves ``ssh_dir``
@@ -279,10 +339,15 @@ def read_known_hosts_text(
     # the open still returns at once and the fstat below refuses it.
     flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
-        fd = os.open(real, flags)
+        fd = _open_through_components(real, final_flags=flags)
     except OSError as exc:
         raise type(exc)(f"{normalized.name!r}: {exc.strerror or type(exc).__name__}") from None
-    with os.fdopen(fd, "rb") as handle:
+    try:
+        handle = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+    with handle:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
             raise NotAKnownHostsFile(f"{normalized.name!r} is not a regular file")
         data = handle.read(max_bytes + 1)

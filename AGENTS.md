@@ -30,8 +30,13 @@ request, macOS only on a push to `main` or a manual `workflow_dispatch`. Confirm
   `fs.read_public_text` (refuses non-`.pub` before opening),
   `fs.read_config_text` (one ssh_config(5) file), `fs.read_known_hosts_text`
   (one known_hosts(5) file, name- and root-checked before opening) — each the
-  single place its kind of file is opened. No `open(` elsewhere in `src` — a
-  test greps for it.
+  single place its kind of file is opened. All three delegate the actual
+  open of the checked real path to the internal `fs._open_through_components`
+  helper, which walks it one path component at a time from `/` via each
+  parent's own directory fd with `O_NOFOLLOW` (task #1802) — a single
+  `os.open(real, O_NOFOLLOW)` only refuses a symlink on the last component,
+  leaving an ancestor directory swappable between the check and the open. No
+  `open(` elsewhere in `src` — a test greps for it.
 - **Private-key trap.** An autouse guard in `tests/conftest.py` fails any test
   that reads a non-`.pub`, non-config file inside the synthetic HOME; the
   `fake_home` fixture plants `~/.ssh/id_canary` (bytes `CANARY-PRIVATE-7f3a`).
