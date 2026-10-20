@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import OpenGuard
 from ssh_id_doctor.cli import main
 from ssh_id_doctor.exit_codes import ExitCode
 
@@ -734,3 +735,59 @@ def test_redact_path_alias_shared_across_whitespace_and_quoting(
     (quoted_alias,) = hb_quoted["identity_references"]
     assert re.fullmatch(r"~/\.\.\./id_host-\d+-[0-9a-f]{8}", plain_alias)
     assert quoted_alias == plain_alias
+
+
+def test_redact_path_alias_not_merged_by_whitespace_in_resolved_path(
+    fake_home: Path,
+    open_guard: OpenGuard,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression (#1908 critic cycle 2, P1): path-alias canonicalization must
+    strip surrounding whitespace/quoting only from a raw, unexpanded
+    ssh_config value (a HostBinding.identity_references entry) -- never from
+    a value that is already a resolved, absolute path (HostBinding.source_file,
+    LocalReference.path, evidence source, ...). A resolved path's trailing
+    space can be a real, significant character of its final path component:
+    two config files literally named 'config' and 'config ' are two
+    different files, and must not collapse onto one alias just because an
+    unconditional ``.strip()`` would make their canonical forms equal.
+
+    Given an ssh config 'config' that Includes a second, real file in the
+    same directory literally named 'config ' (trailing space, written
+    quoted so ssh_config(5) tokenizing keeps the space) -- each file defining
+    one Host block -- when scanning with --redact all,
+    then the two HostBinding.source_file aliases differ (AC-1: 'разные пути
+    не сливаются').
+    """
+    ssh_dir = fake_home / ".ssh"
+    config_path = ssh_dir / "config"
+    included_path = ssh_dir / "config "  # trailing space: a distinct real file
+
+    included_path.write_text("Host beta.example.com\n    IdentityFile ~/.ssh/id_beta\n")
+    open_guard.allow(included_path)
+    config_path.write_text(
+        'Host alpha.example.com\n    IdentityFile ~/.ssh/id_alpha\nInclude "config "\n'
+    )
+
+    rc = main(
+        [
+            "scan",
+            "--format",
+            "json",
+            "--no-agent",
+            "--redact",
+            "all",
+            "--ssh-dir",
+            str(ssh_dir),
+            "--config",
+            str(config_path),
+        ]
+    )
+    assert rc == ExitCode.OK
+    data = json.loads(capsys.readouterr().out)
+
+    assert len(data["host_bindings"]) == 2
+    source_aliases = [hb["source_file"] for hb in data["host_bindings"]]
+    assert len(set(source_aliases)) == 2, "distinct files merged onto one alias"
+    for alias in source_aliases:
+        assert re.fullmatch(r"~/\.\.\./config ?-[0-9a-f]{8}", alias)

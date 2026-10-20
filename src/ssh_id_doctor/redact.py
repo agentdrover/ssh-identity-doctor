@@ -148,7 +148,7 @@ class Redactor:
             self._user_map[user] = f"user-{len(self._user_map) + 1}"
         return self._user_map[user]
 
-    def get_path_alias(self, path: str) -> str:
+    def get_path_alias(self, path: str, *, raw: bool = False) -> str:
         if not path:
             return path
         if path in self._path_map:
@@ -160,7 +160,7 @@ class Redactor:
         # #1908 AC-1): key the alias on the canonical form, keeping the
         # literal-spelling map (self._path_map) only for free-text matching
         # in redact_text_sub.
-        canonical = self._canonical_path(path)
+        canonical = self._canonical_path(path, raw=raw)
         if canonical not in self._path_alias_by_canonical:
             # Deterministic hash of the canonical path to preserve uniqueness
             # -- two paths with the same basename must not collide just
@@ -183,26 +183,39 @@ class Redactor:
         self._path_map[path] = alias
         return alias
 
-    def _canonical_path(self, path: str) -> str:
+    def _canonical_path(self, path: str, *, raw: bool) -> str:
         """Normalize a path for alias deduplication only (never for display).
 
-        First mirrors references.resolve_identity_references' own raw-value
-        preprocessing: strip surrounding whitespace and a matching pair of
-        double quotes (an ``IdentityFile " ~/.ssh/id_x "`` value is stripped
-        before ``_expand`` ever sees it there too) -- otherwise a
-        HostBinding's raw identity_references spelling and the LocalReference
-        computed for the very same entry would canonicalize differently and
-        get two different aliases.
+        ``raw`` must be true only for a value that is itself a literal,
+        unexpanded ssh_config entry (a ``HostBinding.identity_references``
+        item) and false for every value that is already a resolved,
+        absolute path computed elsewhere (``LocalReference.path``,
+        ``source_file``, evidence ``source``, ...). Only a raw config value
+        can carry the surrounding whitespace/quoting ssh_config(5) itself
+        strips before use; an already-resolved path never does, and a
+        trailing space can be a real, significant character of its final
+        component (a file genuinely named e.g. ``config `` is a different
+        file from ``config``) -- stripping it there would wrongly merge two
+        distinct paths onto one alias (sdd-spec #1908 critic finding).
 
-        Then, only when the (stripped) value still carries an unresolved
-        token (``%h``/``%r``/``%d``/``%u``/``${VAR}``): keep it as its own
-        literal identity instead of running it through ``_expand``. A token
-        is never actually a LocalReference (references.py reports it as
-        UnresolvedItem instead, precisely because its value is unknown), and
-        ``_expand``'s ``os.path.normpath`` would otherwise silently cancel a
-        literal ``..`` against the token as if it were one path segment --
-        wrong whenever the token's real expansion has more than one segment,
-        and able to collapse two genuinely different files onto one alias.
+        When ``raw``: first mirror references.resolve_identity_references'
+        own raw-value preprocessing -- strip surrounding whitespace and a
+        matching pair of double quotes (an ``IdentityFile " ~/.ssh/id_x "``
+        value is stripped before ``_expand`` ever sees it there too) --
+        otherwise a HostBinding's raw identity_references spelling and the
+        LocalReference computed for the very same entry would canonicalize
+        differently and get two different aliases.
+
+        Then, only when the value (stripped, if ``raw``) still carries an
+        unresolved token (``%h``/``%r``/``%d``/``%u``/``${VAR}``): keep it as
+        its own literal identity instead of running it through ``_expand``. A
+        token is never actually a LocalReference (references.py reports it
+        as UnresolvedItem instead, precisely because its value is unknown),
+        and ``_expand``'s ``os.path.normpath`` would otherwise silently
+        cancel a literal ``..`` against the token as if it were one path
+        segment -- wrong whenever the token's real expansion has more than
+        one segment, and able to collapse two genuinely different files onto
+        one alias.
 
         Otherwise, run it through the exact same ``references._expand`` call
         (and the same realpath'd home/ssh_dir) that ``resolve_identity_references``
@@ -210,14 +223,17 @@ class Redactor:
         and its already-expanded counterpart collapse to one canonical string
         and thus one alias -- not only for a ``~/...`` value (keyed off HOME),
         but also for a bare relative one (keyed off ssh_dir, which is not
-        HOME/.ssh whenever ``--ssh-dir`` points elsewhere).
+        HOME/.ssh whenever ``--ssh-dir`` points elsewhere). This is a no-op
+        for an already-absolute, already-normalized path.
         """
-        raw = path.strip()
-        if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
-            raw = raw[1:-1]
-        if _TOKEN_RE.search(raw):
-            return raw
-        return str(_expand(raw, self._home_path, self._ssh_dir_path))
+        value = path
+        if raw:
+            value = value.strip()
+            if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+                value = value[1:-1]
+        if _TOKEN_RE.search(value):
+            return value
+        return str(_expand(value, self._home_path, self._ssh_dir_path))
 
     def register_known_hosts_token(self, token: str) -> str:
         """Register one known_hosts(5) host token from a KHS-rule Finding's
@@ -361,7 +377,7 @@ def redact(
             if hb.source_file:
                 redactor.get_path_alias(hb.source_file)
             for ir in hb.identity_references:
-                redactor.get_path_alias(ir)
+                redactor.get_path_alias(ir, raw=True)
         for item in snapshot.unresolved:
             if item.source_file:
                 redactor.get_path_alias(item.source_file)
@@ -384,7 +400,7 @@ def redact(
         )
         user = redactor.get_user_alias(hb.user) if redactor.redact_hosts and hb.user else hb.user
         id_refs = (
-            tuple(redactor.get_path_alias(r) for r in hb.identity_references)
+            tuple(redactor.get_path_alias(r, raw=True) for r in hb.identity_references)
             if redactor.redact_paths
             else hb.identity_references
         )
