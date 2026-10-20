@@ -791,3 +791,63 @@ def test_redact_path_alias_not_merged_by_whitespace_in_resolved_path(
     assert len(set(source_aliases)) == 2, "distinct files merged onto one alias"
     for alias in source_aliases:
         assert re.fullmatch(r"~/\.\.\./config ?-[0-9a-f]{8}", alias)
+
+
+def test_redact_identity_reference_alias_not_reused_from_source_file_cache(
+    fake_home: Path,
+    open_guard: OpenGuard,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression (#1908 critic cycle 3, P1): get_path_alias's literal cache
+    (self._path_map) returns on an exact string match without checking
+    whether the cached alias was canonicalized with the same ``raw`` flag.
+    A HostBinding's own source_file is registered first (``raw=False``,
+    already resolved); if one of its *own* identity_references entries
+    happens to be the exact same literal string (both absolute paths, both
+    carrying a trailing space) -- which references.py will still ``.strip()``
+    before building the matching LocalReference.path -- the cache wrongly
+    reuses the source_file's un-stripped alias for identity_references
+    instead of recomputing with ``raw=True``, so HostBinding.identity_references
+    disagrees with LocalReference.path for the very same entry, and wrongly
+    shares an alias with the (distinct) config file.
+
+    Given a real file literally named 'keyconf ' (trailing space, included by
+    the main config) whose own Host block's IdentityFile value is, verbatim,
+    that same file's absolute path with the trailing space (quoted, so
+    tokenizing keeps it) -- when scanning with --redact all, then the
+    HostBinding.identity_references alias equals the alias of the
+    corresponding LocalReference.path (built from the stripped, space-free
+    value) and NOT the HostBinding.source_file alias.
+    """
+    ssh_dir = fake_home / ".ssh"
+    config_path = ssh_dir / "config"
+    included_path = ssh_dir / "keyconf "  # trailing space: a distinct real file
+
+    included_path.write_text(f'Host self.example.com\n    IdentityFile "{included_path}"\n')
+    open_guard.allow(included_path)
+    config_path.write_text('Include "keyconf "\n')
+
+    rc = main(
+        [
+            "scan",
+            "--format",
+            "json",
+            "--no-agent",
+            "--redact",
+            "all",
+            "--ssh-dir",
+            str(ssh_dir),
+            "--config",
+            str(config_path),
+        ]
+    )
+    assert rc == ExitCode.OK
+    data = json.loads(capsys.readouterr().out)
+
+    (host_binding,) = [hb for hb in data["host_bindings"] if hb["identity_references"]]
+    (id_ref_alias,) = host_binding["identity_references"]
+    source_alias = host_binding["source_file"]
+    assert id_ref_alias != source_alias, "identity reference wrongly merged with its own config"
+
+    local_ref = next(ref for ref in data["local_references"] if ref["kind"] == "config_identity")
+    assert local_ref["path"] == id_ref_alias

@@ -151,8 +151,6 @@ class Redactor:
     def get_path_alias(self, path: str, *, raw: bool = False) -> str:
         if not path:
             return path
-        if path in self._path_map:
-            return self._path_map[path]
 
         # Two spellings of the same file (an ssh config's raw, unexpanded
         # '~/...' IdentityFile value vs. the expanded absolute path computed
@@ -160,6 +158,20 @@ class Redactor:
         # #1908 AC-1): key the alias on the canonical form, keeping the
         # literal-spelling map (self._path_map) only for free-text matching
         # in redact_text_sub.
+        #
+        # Always canonicalize -- never shortcut on an exact `path` match in
+        # self._path_map first. The very same literal string can legitimately
+        # need different canonicalization depending on `raw` (e.g. a
+        # HostBinding.source_file registered as an already-resolved,
+        # whitespace-significant path, and -- in the adversarial but real
+        # case where an IdentityFile value literally names that same config
+        # file -- its own identity_references entry registered moments later
+        # with raw=True, which must still get whitespace-stripped). A cache
+        # keyed only on the literal string, consulted before canonicalizing,
+        # would return the first call's alias for the second regardless of
+        # `raw`, silently merging two different canonical identities (sdd-spec
+        # #1908 critic cycle 3). _canonical_path does no I/O, so recomputing
+        # it on every call costs nothing beyond this correctness guarantee.
         canonical = self._canonical_path(path, raw=raw)
         if canonical not in self._path_alias_by_canonical:
             # Deterministic hash of the canonical path to preserve uniqueness
