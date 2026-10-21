@@ -17,6 +17,8 @@ DenyOpen = Callable[[str | os.PathLike[str]], contextlib.AbstractContextManager[
 import can resolve to either same-named module): no e2e test imports this fixture
 itself, but a sibling test module's ``from conftest import ... DenyOpen`` must
 succeed whichever of the two ``conftest`` modules Python's import cache hands it."""
+OpenedPaths = list[str]
+"""Duplicated from ../conftest.py for the same reason as ``DenyOpen`` above."""
 CANARY = "CANARY-PRIVATE-7f3a"
 CANARY_PRIVATE_KEY = (
     f"-----BEGIN OPENSSH PRIVATE KEY-----\n{CANARY}\n-----END OPENSSH PRIVATE KEY-----\n"

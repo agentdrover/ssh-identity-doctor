@@ -130,11 +130,40 @@ def _functions_calling_os_open(source: str) -> set[str]:
     return found
 
 
+def _functions_calling_name(source: str, name: str) -> set[str]:
+    """Like :func:`_functions_calling_os_open`, but for a plain (non-attribute) call
+    to ``name`` -- used to check who calls the internal ``_open_through_components``
+    helper, since fs.py's three readers no longer call ``os.open`` directly (task
+    #1802): they delegate the checked real path to that one shared helper instead."""
+    tree = ast.parse(source)
+    found: set[str] = set()
+
+    class _Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.stack: list[str] = []
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_Call(self, node: ast.Call) -> None:
+            func = node.func
+            if self.stack and isinstance(func, ast.Name) and func.id == name:
+                found.add(self.stack[-1])
+            self.generic_visit(node)
+
+    _Visitor().visit(tree)
+    return found
+
+
 def test_known_hosts_inspector_boundaries() -> None:
     """AC-2: inspectors/known_hosts.py passes the general open/subprocess ban (it is
     not in AUDITED, so test_src_has_no_direct_subprocess_or_open already covers it)
     and does not import ssh_id_doctor.process or subprocess by name; fs.py has
-    exactly three functions that call os.open — the three reader functions."""
+    exactly one function that calls os.open directly -- the shared
+    ``_open_through_components`` helper (task #1802) -- and exactly the three reader
+    functions call that helper, each the single place its kind of file is opened."""
     known_hosts_path = SRC / "inspectors" / "known_hosts.py"
     source = known_hosts_path.read_text()
 
@@ -154,7 +183,8 @@ def test_known_hosts_inspector_boundaries() -> None:
     assert "subprocess" not in imported
 
     fs_source = (SRC / "fs.py").read_text()
-    assert _functions_calling_os_open(fs_source) == {
+    assert _functions_calling_os_open(fs_source) == {"_open_through_components"}
+    assert _functions_calling_name(fs_source, "_open_through_components") == {
         "read_public_text",
         "read_config_text",
         "read_known_hosts_text",

@@ -25,6 +25,8 @@ import contextlib
 import errno
 import io
 import os
+import stat
+import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,12 +52,86 @@ class PrivateReadAttempt(AssertionError):
     """Raised by the guard when a test's code tries to read a protected file."""
 
 
+def _fd_realpath(fd: int) -> str | None:
+    """The real path an open fd currently refers to, straight from the kernel.
+
+    Review #1802 gen1 (medium, conftest.py:88): the previous implementation
+    looked ``dir_fd`` up in a cache this module populated itself when *it* saw
+    the fd opened (``guarded_os_open`` below); an fd this module never saw get
+    opened -- ``os.dup`` of a tracked one, or one obtained some other way --
+    was simply absent from that cache, and the caller silently fell back to
+    resolving against the process CWD instead. That let a disallowed relative
+    open routed through such an fd compute the wrong real path and slip past
+    the guard, ``deny_open`` and ``opened_paths`` alike. Asking the kernel what
+    the fd itself currently names, instead of trusting bookkeeping a test's own
+    code can route around, has no such blind spot: it is correct for every
+    live fd, by construction, regardless of how it was obtained. Returns
+    ``None`` if the fd's path cannot be determined at all (closed, or an
+    unsupported platform) -- callers must treat that as a guard violation, not
+    fall back to the CWD guess this replaces.
+    """
+    if sys.platform == "darwin":
+        import fcntl
+
+        try:
+            buf = fcntl.fcntl(fd, fcntl.F_GETPATH, b"\0" * 1024)
+        except OSError:
+            return None
+        return buf.split(b"\0", 1)[0].decode()
+    try:
+        return os.readlink(f"/proc/self/fd/{fd}")
+    except OSError:
+        return None
+
+
 @dataclass
 class OpenGuard:
     home: str
     violations: list[str] = field(default_factory=list)
     allowed: set[str] = field(default_factory=set)
     extra_roots: list[str] = field(default_factory=list)
+
+    def resolve_relative(self, path: str | os.PathLike[str], dir_fd: int) -> str:
+        """The real path of ``path``, opened relative to ``dir_fd``.
+
+        ``os.path.realpath`` on the bare component name alone would resolve it
+        against the process CWD, not against the directory ``dir_fd`` actually
+        names (task #1802: fs.py now opens every path component through its
+        parent's own fd instead of a single absolute path). Resolves the
+        parent's real path live, via :func:`_fd_realpath`, instead of a cache
+        this module populated itself (review #1802 gen1, medium, conftest.py:88
+        -- see ``_fd_realpath`` for why); an unresolvable ``dir_fd`` is a guard
+        violation, not a silent fallback to the CWD.
+
+        Critic finding (cycle 1): a plain lexical join of the parent's real
+        path and ``raw`` is only correct while ``raw`` is not itself a
+        symlink. If an ancestor component was swapped for one -- exactly the
+        bypass task #1802 exists to refuse -- the thing actually named lives
+        wherever that symlink points, not at the pre-swap lexical location;
+        every caller of this method (the protected-path check below,
+        ``opened_paths``, ``deny_open``) would keep reporting the old,
+        safe-looking path and silently miss a real bypass. So check first,
+        via ``os.lstat`` with ``dir_fd``, whether ``raw`` is currently a
+        symlink and, if so, follow it with ``os.readlink`` (which also takes
+        ``dir_fd``) and resolve that target for real, instead of assuming it
+        still names what the lexical join implies.
+        """
+        raw = os.fsdecode(os.fspath(path))
+        parent = _fd_realpath(dir_fd)
+        if parent is None:
+            message = f"cannot resolve dir_fd {dir_fd} to a real path for {raw!r}"
+            self.violations.append(message)
+            raise PrivateReadAttempt(message)
+        try:
+            is_symlink = stat.S_ISLNK(os.lstat(raw, dir_fd=dir_fd).st_mode)
+        except OSError:
+            is_symlink = False
+        if not is_symlink:
+            return os.path.normpath(os.path.join(parent, raw))
+        target = os.readlink(raw, dir_fd=dir_fd)
+        if not os.path.isabs(target):
+            target = os.path.join(parent, target)
+        return os.path.realpath(target)
 
     def guard_root(self, *roots: str | os.PathLike[str]) -> None:
         """Protect another synthetic HOME with the same rules as ``home``.
@@ -131,7 +207,24 @@ def _private_open_guard(
         return real_open(file, mode, *args, **kwargs)
 
     def guarded_os_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
-        guard.check(path, _flags_read(flags))
+        # task #1802: fs.py now opens a checked real path one component at a
+        # time via dir_fd instead of a single absolute os.open, so a bare
+        # relative name with dir_fd set must resolve against that parent's
+        # real path, not the CWD; and opening a directory to walk through it
+        # (O_DIRECTORY) is not a content read and must never trip the guard,
+        # unlike opening the final file component.
+        is_dir_open = bool(flags & os.O_DIRECTORY)
+        dir_fd = kwargs.get("dir_fd")
+        is_fd_path = isinstance(path, int)
+        real: str | None
+        if is_fd_path:
+            real = None
+        elif dir_fd is not None:
+            real = guard.resolve_relative(path, dir_fd)
+        else:
+            real = os.path.realpath(os.fsdecode(os.fspath(path)))
+        if real is not None:
+            guard.check(real, _flags_read(flags) and not is_dir_open)
         return real_os_open(path, flags, *args, **kwargs)
 
     def guarded_path(real: Callable[..., Any]) -> Callable[..., Any]:
@@ -179,12 +272,22 @@ def deny_open(open_guard: OpenGuard, monkeypatch: pytest.MonkeyPatch) -> DenyOpe
 
     @contextlib.contextmanager
     def _deny(path: str | os.PathLike[str]) -> Iterator[None]:
-        target = os.fspath(path)
+        target = os.path.realpath(os.fspath(path))
         current_os_open = os.open
 
         def denied_open(candidate: Any, flags: int, *args: Any, **kwargs: Any) -> int:
-            if os.fspath(candidate) == target:
-                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), target)
+            dir_fd = kwargs.get("dir_fd")
+            if not isinstance(candidate, int):
+                # task #1802: the final open fs.py denies here may now be a
+                # dir_fd-relative bare name (see guarded_os_open above), so
+                # resolve it against the recorded parent before comparing.
+                resolved = (
+                    open_guard.resolve_relative(candidate, dir_fd)
+                    if dir_fd is not None
+                    else os.path.realpath(os.fspath(candidate))
+                )
+                if resolved == target:
+                    raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), target)
             return current_os_open(candidate, flags, *args, **kwargs)
 
         with monkeypatch.context() as ctx:
@@ -192,6 +295,65 @@ def deny_open(open_guard: OpenGuard, monkeypatch: pytest.MonkeyPatch) -> DenyOpe
             yield
 
     return _deny
+
+
+OpenedPaths = list[str]
+"""Every file (not directory) real path opened via ``builtins.open``/``io.open``/
+``os.open`` while a test runs."""
+
+
+@pytest.fixture
+def opened_paths(open_guard: OpenGuard, monkeypatch: pytest.MonkeyPatch) -> OpenedPaths:
+    """Every file actually opened for reading while the test runs, by real path.
+
+    Directory opens (``O_DIRECTORY``, task #1802's per-component walk) are not
+    recorded: they are traversal, not a read of file content, and recording them
+    would bury the one path a test actually wants to assert on in a pile of
+    ancestor directories. A ``dir_fd``-relative open resolves against
+    ``open_guard``'s recorded parent real paths, same as the guard itself.
+    """
+    seen: list[str] = []
+    real_open = builtins.open
+    real_os_open = os.open
+
+    def recording_open(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        if not isinstance(file, int):
+            seen.append(os.path.realpath(os.fspath(file)))
+        return real_open(file, mode, *args, **kwargs)
+
+    def recording_os_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        is_dir_open = bool(flags & os.O_DIRECTORY)
+        dir_fd = kwargs.get("dir_fd")
+        if not is_dir_open and not isinstance(path, int):
+            real = (
+                open_guard.resolve_relative(path, dir_fd)
+                if dir_fd is not None
+                else os.path.realpath(os.fspath(path))
+            )
+            seen.append(real)
+        return real_os_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", recording_open)
+    monkeypatch.setattr(io, "open", recording_open)
+    monkeypatch.setattr(os, "open", recording_os_open)
+    return seen
+
+
+@pytest.fixture
+def fd_balance() -> Callable[[], int]:
+    """Net open file descriptors relative to when this fixture was first used.
+
+    AC-2 (#1802): every intermediate directory fd the per-component walk opens must
+    be closed again — on success, on a mid-walk failure, and on a failed ``fdopen``
+    of the final fd. Counts real descriptors via ``/dev/fd`` (a symlink to
+    ``/proc/self/fd`` on Linux; present on macOS too) rather than intercepting
+    ``os.open``/``os.close``: a descriptor closed through a wrapping file object's
+    own ``close()`` (``os.fdopen(fd)`` on the success path) calls the C-level close
+    directly, never through a patched ``os.close``, so counting Python-level calls
+    alone would always show a one-descriptor "leak" on every successful read.
+    """
+    baseline = len(os.listdir("/dev/fd"))
+    return lambda: len(os.listdir("/dev/fd")) - baseline
 
 
 DenyOpenInDir = Callable[[str | os.PathLike[str]], contextlib.AbstractContextManager[None]]
