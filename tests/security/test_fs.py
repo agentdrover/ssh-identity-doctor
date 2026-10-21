@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import stat
 import traceback
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -103,6 +104,77 @@ def test_read_config_text_refuses_oversize_and_private_material(tmp_path: Path) 
     with pytest.raises(PrivateKeyAccessDenied) as leaked:
         fs.read_config_text(private)
     assert CANARY not in str(leaked.value)
+
+
+_PRE_STAT_READERS: dict[str, Callable[[Path], str]] = {
+    "public_key": fs.read_public_text,
+    "config": fs.read_config_text,
+}
+
+
+@pytest.mark.parametrize("reader_name", sorted(_PRE_STAT_READERS))
+def test_missing_file_pre_stat_error_does_not_leak_path(
+    reader_name: str, tmp_path: Path, open_guard: OpenGuard
+) -> None:
+    """Review #1802 gen1 (low, fs.py:229/272, pre-existing): the pre-open ``os.stat``
+    call in ``read_public_text``/``read_config_text`` was unwrapped, so a missing
+    file raised the stdlib's own ``FileNotFoundError`` — full path and all, in both
+    the message and (via ``__cause__``) a rendered traceback — the same class
+    ``read_known_hosts_text`` already guards against. Closed the same way now that
+    all three readers are already being changed for task #1802."""
+    root = tmp_path / "root"
+    root.mkdir()
+    open_guard.guard_root(root)
+    missing_name = "missing.pub" if reader_name == "public_key" else "missing_config"
+    target = root / missing_name
+
+    with pytest.raises(FileNotFoundError) as exc_info:
+        _PRE_STAT_READERS[reader_name](target)
+    assert exc_info.value.__cause__ is None
+    assert str(root) not in str(exc_info.value)
+    rendered = "".join(
+        traceback.format_exception(
+            type(exc_info.value), exc_info.value, exc_info.value.__traceback__
+        )
+    )
+    assert str(root) not in rendered
+    assert str(target) not in rendered
+
+
+@pytest.mark.parametrize("reader_name", sorted(_PRE_STAT_READERS))
+def test_pre_stat_permission_error_does_not_leak_path(
+    reader_name: str, tmp_path: Path, open_guard: OpenGuard, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Companion to the missing-file case above, forcing the same ``except OSError``
+    branch with a ``PermissionError`` instead (e.g. an unreadable ancestor) —
+    exactly the regression ``test_stat_error_traceback_has_no_full_path`` below
+    already covers for ``read_known_hosts_text``."""
+    root = tmp_path / "root"
+    root.mkdir()
+    open_guard.guard_root(root)
+    name = "locked.pub" if reader_name == "public_key" else "locked_config"
+    target = root / name
+    target.write_text("placeholder\n")
+    real_target = os.path.realpath(target)
+    real_stat = os.stat
+
+    def failing_stat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if os.fspath(path) == real_target:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", failing_stat)
+
+    with pytest.raises(PermissionError) as exc_info:
+        _PRE_STAT_READERS[reader_name](target)
+    assert exc_info.value.__cause__ is None
+    rendered = "".join(
+        traceback.format_exception(
+            type(exc_info.value), exc_info.value, exc_info.value.__traceback__
+        )
+    )
+    assert str(root) not in rendered
+    assert str(target) not in rendered
 
 
 def test_read_known_hosts_text_refusals(

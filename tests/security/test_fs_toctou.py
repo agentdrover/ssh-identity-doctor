@@ -18,6 +18,7 @@ routed through ``dir_fd``.
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import traceback
 from collections.abc import Callable, Iterator
@@ -268,6 +269,94 @@ def test_component_open_leaks_no_descriptors(
             os.close(os.open("id_private", os.O_RDONLY, dir_fd=dir_fd))
     finally:
         os.close(dir_fd)
+    assert len(open_guard.violations) == 1
+    open_guard.violations.clear()  # deliberate violation; do not fail teardown
+
+
+@pytest.mark.parametrize(
+    "case_name",
+    ["public_key", "config", "known_hosts_nested_ancestor"],
+)
+def test_ancestor_without_read_permission_is_still_readable_with_search_permission(
+    case_name: str,
+    tmp_path: Path,
+    open_guard: OpenGuard,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review #1802 gen1 (medium, fs.py:156): opening an ancestor directory with
+    plain ``O_RDONLY`` requests read access from the kernel, which needs the
+    read permission bit on every ancestor just to obtain an fd through it --
+    even one that is traversable (execute permission) but closed to listing
+    (no read permission), a path the old single ``os.open(real, O_NOFOLLOW)``
+    never needed read access on. ``chmod`` cannot simulate that denial here
+    (it is a no-op under root -- SID #1860), so this injects ``EACCES`` on
+    exactly the open call that would have requested real read access on the
+    chosen ancestor; :data:`fs._ANCESTOR_ACCESS_FLAG` (``O_PATH`` on Linux)
+    must keep that call from ever requesting it, so the read still succeeds.
+    """
+    if fs._ANCESTOR_ACCESS_FLAG == os.O_RDONLY:
+        pytest.skip("no search-only directory-open primitive on this platform")
+
+    root = tmp_path / "root"
+    root.mkdir()
+    open_guard.guard_root(root)
+
+    target, ancestor, read = _build_case(case_name, root)
+    locked_real = os.path.realpath(ancestor)
+    real_os_open = os.open
+
+    def picky_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        dir_fd = kwargs.get("dir_fd")
+        if not isinstance(path, int):
+            resolved = (
+                open_guard.resolve_relative(path, dir_fd)
+                if dir_fd is not None
+                else os.path.realpath(os.fspath(path))
+            )
+            if resolved == locked_real and not flags & fs._ANCESTOR_ACCESS_FLAG:
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), locked_real)
+        return real_os_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", picky_open)
+
+    assert read() == target.read_text()
+
+
+def test_dir_fd_tracking_resolves_a_duplicated_fd_not_just_ones_it_opened(
+    tmp_path: Path,
+    open_guard: OpenGuard,
+) -> None:
+    """Review #1802 gen1 (medium, conftest.py:88): the harness used to look a
+    ``dir_fd`` up in a cache it populated itself only when its own ``os.open``
+    wrapper saw that exact fd number get opened with ``O_DIRECTORY``. A
+    duplicate of a tracked fd (``os.dup``) -- the original closed, so only
+    the dup remains live, as a stand-in for any fd this module never itself
+    saw opened -- was simply absent from that cache, so ``resolve_relative``
+    silently fell back to resolving the relative open against the process
+    CWD instead of the directory the fd actually names: a disallowed read
+    routed through it would then resolve to some CWD-relative path that is
+    almost certainly not inside the guarded root, letting it slip past the
+    guard entirely (the AC-1 ancestor-swap tests' own negative check -- 'the
+    outside file was never opened' -- could pass for the wrong reason).
+    ``OpenGuard.resolve_relative`` now asks the kernel what the fd currently
+    refers to (task #1802 review gen1 fix) instead of trusting that
+    bookkeeping, so a dup'd, previously-untracked fd resolves exactly like
+    the original and the guard still catches the read.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    open_guard.guard_root(root)
+    private = root / "id_private"
+    private.write_text("private material, not a .pub/.conf/config/known_hosts name\n")
+
+    dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    dup_fd = os.dup(dir_fd)
+    os.close(dir_fd)
+    try:
+        with pytest.raises(AssertionError):
+            os.close(os.open("id_private", os.O_RDONLY, dir_fd=dup_fd))
+    finally:
+        os.close(dup_fd)
     assert len(open_guard.violations) == 1
     open_guard.violations.clear()  # deliberate violation; do not fail teardown
 

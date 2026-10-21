@@ -47,6 +47,30 @@ from pathlib import Path
 
 from ssh_id_doctor.domain import Resolution
 
+_ANCESTOR_ACCESS_FLAG = (
+    getattr(os, "O_PATH", None)
+    or getattr(os, "O_SEARCH", None)
+    or getattr(os, "O_EXEC", None)
+    or os.O_RDONLY
+)
+"""The access mode for opening an *ancestor* directory fd in
+:func:`_open_through_components` -- one that is only ever used as a ``dir_fd``
+for the next ``openat``, never read from directly, so it should require
+execute/search permission on the directory (to traverse into it), not read
+permission on it (to list its contents, which never happens here). Plain
+``O_RDONLY`` requests read access from the kernel and so needs read
+permission on every ancestor just to get an fd through it -- even one closed
+to listing but still traversable by name (review #1802 gen1, medium,
+fs.py:156) -- breaking a scan of a path like that, which a single
+``os.open(real, O_NOFOLLOW)`` never needed. ``O_PATH`` (Linux) opens a
+location reference without requesting any access to its content and so is
+exempt from that permission check, needing only search permission on the
+path leading to it; macOS has no ``O_PATH`` but a Python build that defines
+``O_SEARCH``/``O_EXEC`` gets the same effect. Without any of those, this
+falls back to the original ``O_RDONLY`` -- same behavior as before this fix,
+not a regression -- and the caller's existing sanitized-``OSError`` wrapping
+still keeps the full path out of the resulting permission error."""
+
 PUBLIC_SUFFIX = ".pub"
 MAX_PUBLIC_BYTES = 64 * 1024
 """A public key is a single short line; anything larger is not one."""
@@ -151,9 +175,15 @@ def _open_through_components(real_path: Path, *, final_flags: int) -> int:
     Returns an fd for the final component, opened with ``final_flags`` (the caller
     owns it). Every intermediate directory fd is closed — on success, on a
     mid-walk failure, and if the final ``os.open`` itself fails.
+
+    Every ancestor is opened with :data:`_ANCESTOR_ACCESS_FLAG`, not
+    ``O_RDONLY``: an ancestor fd here is only ever used as the next
+    component's ``dir_fd``, never read from, so it should need only
+    search/execute permission on the directory, not read permission (review
+    #1802 gen1, medium, fs.py:156).
     """
     names = real_path.parts[1:]
-    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    dir_flags = _ANCESTOR_ACCESS_FLAG | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     parent_fd = os.open(os.sep, dir_flags)
     try:
         for name in names[:-1]:
@@ -220,13 +250,23 @@ def read_public_text(path: str | os.PathLike[str], *, max_bytes: int = MAX_PUBLI
     any line (not just the first). A target that is not a regular file (FIFO,
     socket, device) is refused with :class:`NotAPublicKeyFile` before any
     ``open``, as is content over ``max_bytes``. The message names the file only by its base
-    name and never quotes file content.
+    name and never quotes file content — including an ``OSError`` raised by the
+    pre-open ``stat`` itself (e.g. a missing file, or a :class:`PermissionError`
+    on an ancestor), which the stdlib would otherwise format with the full path
+    (review #1802 gen1, low, pre-existing).
     """
     normalized = _normalize(path)
     real = Path(os.path.realpath(normalized))
     if normalized.suffix != PUBLIC_SUFFIX or real.suffix != PUBLIC_SUFFIX:
         raise PrivateKeyAccessDenied(f"refusing to read non-.pub file {normalized.name!r}")
-    if not stat.S_ISREG(os.stat(real).st_mode):
+    try:
+        pre_open_mode = os.stat(real).st_mode
+    except OSError as exc:
+        # `from None`, not `from exc`: chaining would keep the original OSError
+        # (whose stdlib __str__ embeds the full path via .filename) reachable
+        # from this exception's traceback, undoing the sanitized message above.
+        raise type(exc)(f"{normalized.name!r}: {exc.strerror or type(exc).__name__}") from None
+    if not stat.S_ISREG(pre_open_mode):
         raise NotAPublicKeyFile(f"{normalized.name!r} is not a regular file")
     # O_NONBLOCK: should the path be swapped for a FIFO after the check above,
     # the open still returns at once and the fstat below refuses it.
@@ -265,11 +305,21 @@ def read_config_text(path: str | os.PathLike[str], *, max_bytes: int = MAX_CONFI
     refused with :class:`PrivateKeyAccessDenied` after reading, same as a
     public key (SEC-001: a config can name a real key path but must never
     carry one inline). The message names the file only by its base name and
-    never quotes file content.
+    never quotes file content — including an ``OSError`` raised by the
+    pre-open ``stat`` itself (e.g. a missing file, or a :class:`PermissionError`
+    on an ancestor), which the stdlib would otherwise format with the full path
+    (review #1802 gen1, low, pre-existing).
     """
     normalized = _normalize(path)
     real = Path(os.path.realpath(normalized))
-    if not stat.S_ISREG(os.stat(real).st_mode):
+    try:
+        pre_open_mode = os.stat(real).st_mode
+    except OSError as exc:
+        # `from None`, not `from exc`: chaining would keep the original OSError
+        # (whose stdlib __str__ embeds the full path via .filename) reachable
+        # from this exception's traceback, undoing the sanitized message above.
+        raise type(exc)(f"{normalized.name!r}: {exc.strerror or type(exc).__name__}") from None
+    if not stat.S_ISREG(pre_open_mode):
         raise NotAConfigFile(f"{normalized.name!r} is not a regular file")
     # O_NONBLOCK: should the path be swapped for a FIFO after the check above,
     # the open still returns at once and the fstat below refuses it.

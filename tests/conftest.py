@@ -26,6 +26,7 @@ import errno
 import io
 import os
 import stat
+import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,13 +52,44 @@ class PrivateReadAttempt(AssertionError):
     """Raised by the guard when a test's code tries to read a protected file."""
 
 
+def _fd_realpath(fd: int) -> str | None:
+    """The real path an open fd currently refers to, straight from the kernel.
+
+    Review #1802 gen1 (medium, conftest.py:88): the previous implementation
+    looked ``dir_fd`` up in a cache this module populated itself when *it* saw
+    the fd opened (``guarded_os_open`` below); an fd this module never saw get
+    opened -- ``os.dup`` of a tracked one, or one obtained some other way --
+    was simply absent from that cache, and the caller silently fell back to
+    resolving against the process CWD instead. That let a disallowed relative
+    open routed through such an fd compute the wrong real path and slip past
+    the guard, ``deny_open`` and ``opened_paths`` alike. Asking the kernel what
+    the fd itself currently names, instead of trusting bookkeeping a test's own
+    code can route around, has no such blind spot: it is correct for every
+    live fd, by construction, regardless of how it was obtained. Returns
+    ``None`` if the fd's path cannot be determined at all (closed, or an
+    unsupported platform) -- callers must treat that as a guard violation, not
+    fall back to the CWD guess this replaces.
+    """
+    if sys.platform == "darwin":
+        import fcntl
+
+        try:
+            buf = fcntl.fcntl(fd, fcntl.F_GETPATH, b"\0" * 1024)
+        except OSError:
+            return None
+        return buf.split(b"\0", 1)[0].decode()
+    try:
+        return os.readlink(f"/proc/self/fd/{fd}")
+    except OSError:
+        return None
+
+
 @dataclass
 class OpenGuard:
     home: str
     violations: list[str] = field(default_factory=list)
     allowed: set[str] = field(default_factory=set)
     extra_roots: list[str] = field(default_factory=list)
-    dir_fd_realpath: dict[int, str] = field(default_factory=dict)
 
     def resolve_relative(self, path: str | os.PathLike[str], dir_fd: int) -> str:
         """The real path of ``path``, opened relative to ``dir_fd``.
@@ -65,10 +97,11 @@ class OpenGuard:
         ``os.path.realpath`` on the bare component name alone would resolve it
         against the process CWD, not against the directory ``dir_fd`` actually
         names (task #1802: fs.py now opens every path component through its
-        parent's own fd instead of a single absolute path). Looks up the
-        parent's real path recorded when its own fd was opened with
-        ``O_DIRECTORY`` (see ``guarded_os_open`` below); unknown ``dir_fd``
-        falls back to resolving against the CWD, same as before.
+        parent's own fd instead of a single absolute path). Resolves the
+        parent's real path live, via :func:`_fd_realpath`, instead of a cache
+        this module populated itself (review #1802 gen1, medium, conftest.py:88
+        -- see ``_fd_realpath`` for why); an unresolvable ``dir_fd`` is a guard
+        violation, not a silent fallback to the CWD.
 
         Critic finding (cycle 1): a plain lexical join of the parent's real
         path and ``raw`` is only correct while ``raw`` is not itself a
@@ -84,9 +117,11 @@ class OpenGuard:
         still names what the lexical join implies.
         """
         raw = os.fsdecode(os.fspath(path))
-        parent = self.dir_fd_realpath.get(dir_fd)
+        parent = _fd_realpath(dir_fd)
         if parent is None:
-            return os.path.realpath(raw)
+            message = f"cannot resolve dir_fd {dir_fd} to a real path for {raw!r}"
+            self.violations.append(message)
+            raise PrivateReadAttempt(message)
         try:
             is_symlink = stat.S_ISLNK(os.lstat(raw, dir_fd=dir_fd).st_mode)
         except OSError:
@@ -190,10 +225,7 @@ def _private_open_guard(
             real = os.path.realpath(os.fsdecode(os.fspath(path)))
         if real is not None:
             guard.check(real, _flags_read(flags) and not is_dir_open)
-        fd = real_os_open(path, flags, *args, **kwargs)
-        if is_dir_open and real is not None:
-            guard.dir_fd_realpath[fd] = real
-        return fd
+        return real_os_open(path, flags, *args, **kwargs)
 
     def guarded_path(real: Callable[..., Any]) -> Callable[..., Any]:
         def wrapper(self: Path, *args: Any, **kwargs: Any) -> Any:
